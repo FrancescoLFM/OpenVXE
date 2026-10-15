@@ -45,6 +45,12 @@ Output report ID `0x08`, 16-byte payload:
 | `[15]` | checksum: `0x55 - (0x08 + sum([0..14]))`, i.e. the payload sums to `0x4D` |
 
 Replies arrive as input reports with the same report ID and echo command and address.
+A `SetEEPROM` is acknowledged by echoing the whole request (status 0) after ~80 ms. 🟢
+
+**Sleep:** while the mouse sleeps (sleep timer at `0xAD`) the dongle does not answer or
+forward requests: queries get no reply and writes are silently lost. Requests work again
+a few seconds after the mouse wakes up. Software must treat "no reply" as "mouse asleep"
+and retry, never assume a write succeeded without the echo. 🟢
 Confidence: ✅ vendor; checksum verified against a published raw frame (unit test
 `eeprom_read_matches_published_frame`).
 
@@ -147,9 +153,13 @@ automatically):
 - **Polling rate, LOD, debounce, angle snapping** are written as 4 bytes at `0x70`
   (`[register, value, 0, 0x55 - value]`). In the vendor map `0x70` is the **forward
   button** record, and these writes don't have a valid record checksum. No source other
-  than OpenVXE describes this scheme: it may be a real "live settings" register on this
-  dongle, or it may be corrupting the forward button. ❓ — **check with
-  `vxe-probe --dump --from 60 --to 78` before and after changing those settings.**
+  than OpenVXE describes this scheme. **Tested** (polling 500 Hz packet): the mouse echoes
+  it, but the EEPROM does not change — the forward button stays `01 10 00 44` and the report
+  rate at `0x00` stays 1000 Hz. The firmware most likely drops records with a bad checksum.
+  These writes are harmless but are not persisted; any non-persistent live effect is
+  unverified. 🟢
+- **A correct write works:** `SetEEPROM 0x0000 len=2 [02 53]` changed the report rate to
+  500 Hz (verified by reading it back), and `[01 54]` restored 1000 Hz. 🟢
 
 ## Sources
 

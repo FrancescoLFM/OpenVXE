@@ -71,7 +71,9 @@ I device vengono aperti una sola volta all'avvio. Se il mouse/dongle viene stacc
 
 ---
 
-### 🔴 1.12 Le scritture a `0x70` potrebbero sovrascrivere il tasto avanti
+### 🟠 1.12 Le scritture a `0x70` non vengono salvate (verificato: il tasto avanti non viene toccato)
+**Test sull'hardware:** il pacchetto legacy (polling 500 Hz) viene confermato dal mouse, ma l'EEPROM non cambia: il tasto avanti resta intatto e il polling resta 1000 Hz. Quindi polling, LOD, debounce e angle snapping della TUI probabilmente non hanno alcun effetto. Una scrittura `SetEEPROM` corretta a `0x00` funziona invece ed è stata verificata. Testo originale:
+
 Polling rate, LOD, debounce e angle snapping vengono scritti come record di 4 byte all'indirizzo `0x70`. Nella mappa EEPROM del vendor `0x70` è il record del **tasto avanti**, e questi record non hanno un checksum valido. Nessuna fonte oltre OpenVXE conferma lo schema "registri sensore" a `0x70`. Da verificare con `vxe-probe --dump --from 60 --to 78` prima e dopo aver cambiato uno di quei settaggi. Se confermato, usare gli indirizzi del vendor: `0x00` polling, `0x0A` LOD, `0xA9` debounce.
 
 ### ✅ 1.13 La batteria usa il comando sbagliato (risolto)
@@ -193,10 +195,12 @@ src/
    - fatto: `docs/PROTOCOL.md` con fonti e livelli di confidenza, `docs/CAPTURE.md`, `vxe-decode`, `vxe-probe` (`--info`, `--dump` in sola lettura, allowlist dei comandi), sniffer su file (`OPENVXE_SNIFF`);
    - ✅ verificato col mouse (`--info`, `--dump`): batteria `0x04`, CID/MID 2,31 (PAW3395SE), firmware 3.15, mappa EEPROM (stadi DPI, colori, tasti, debounce/motion sync/sleep); tasto avanti integro;
    - ✅ risolti 1.7, 1.13 e in parte 1.5 (un'apertura per path, solo interfacce vendor), regola udev rinominata `70-` (con `99-` l'ACL non veniva applicata);
-   - da fare: verificare se le scritture legacy a `0x70` vengono applicate o rifiutate (1.12), test di una scrittura `SetEEPROM` corretta;
+   - ✅ scritture testate: `SetEEPROM` a `0x00` (polling 1000→500→1000 Hz) funziona e viene confermata con un eco; il pacchetto legacy a `0x70` viene confermato ma ignorato (1.12); EEPROM finale identica al backup;
+   - ✅ scoperto che con il mouse in sleep il dongle non risponde e le scritture vanno perse: la TUI deve gestire "nessuna risposta";
    - poi: lettura config all'avvio (2.1), codifica DPI corretta (1.1), stadi DPI (2.2), fix 1.6, 1.12 e 1.13.
-4. **Robustezza**: filtro interfacce e gestione errori (1.5), hotplug (1.8), batteria `Option` + carica (1.7).
-5. **Feature utente**: profili (2.5), CLI (2.6), UX (2.7).
-6. **Espansione**: rimappatura tasti/macro (2.3), altri modelli/chipset, multipiattaforma, pacchetti.
+4. **TUI sul protocollo reale** (prossima): leggere la config all'avvio (`GetEEPROM`), scrivere i singoli campi agli indirizzi del vendor (`0x00` polling, `0x0A` LOD, `0xA9` debounce, `0xAB` motion sync, `0xAD` sleep, `0x0C+` stadi DPI con codici PAW3395SE), confermare ogni scrittura con l'eco, gestire il mouse in sleep (1.1, 1.2, 1.6, 1.12, 2.1, 2.2).
+5. **Robustezza**: filtro interfacce e gestione errori (1.5), hotplug (1.8), batteria `Option` + carica (1.7).
+6. **Feature utente**: profili (2.5), CLI (2.6), UX (2.7).
+7. **Espansione**: rimappatura tasti/macro (2.3), altri modelli/chipset, multipiattaforma, pacchetti.
 
 Ogni punto è un buon candidato per una PR separata e piccola.
