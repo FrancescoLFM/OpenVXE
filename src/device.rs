@@ -3,16 +3,34 @@
 use crate::protocol::{Packet, VXE_PID, VXE_VID};
 use hidapi::{HidApi, HidDevice};
 
-/// Open every HID interface of the mouse in non-blocking mode.
+/// First vendor-defined HID usage page.
+const VENDOR_USAGE_PAGE: u16 = 0xff00;
+
+/// Open the mouse interfaces in non-blocking mode, once per device path.
+///
+/// hidapi lists one entry per top-level collection, so the same path (e.g. one hidraw
+/// node) can appear several times. Only paths exposing a vendor usage page are opened;
+/// if no entry reports usage pages, every path is opened.
 pub fn open_devices(api: &HidApi) -> Vec<HidDevice> {
+    let entries: Vec<_> = api
+        .device_list()
+        .filter(|info| info.vendor_id() == VXE_VID && info.product_id() == VXE_PID)
+        .collect();
+    let has_vendor_page = entries.iter().any(|info| info.usage_page() >= VENDOR_USAGE_PAGE);
+
+    let mut paths = Vec::new();
+    for info in entries {
+        if (!has_vendor_page || info.usage_page() >= VENDOR_USAGE_PAGE) && !paths.contains(&info.path()) {
+            paths.push(info.path());
+        }
+    }
+
     let mut devices = Vec::new();
-    for info in api.device_list() {
-        if info.vendor_id() == VXE_VID && info.product_id() == VXE_PID {
-            if let Ok(dev) = info.open_device(api) {
-                // A blocking device would freeze the UI loop, so skip it.
-                if dev.set_blocking_mode(false).is_ok() {
-                    devices.push(dev);
-                }
+    for path in paths {
+        if let Ok(dev) = api.open_path(path) {
+            // A blocking device would freeze the UI loop, so skip it.
+            if dev.set_blocking_mode(false).is_ok() {
+                devices.push(dev);
             }
         }
     }

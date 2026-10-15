@@ -177,7 +177,11 @@ fn run(opts: Options) -> Result<(), String> {
     let packet = build(&opts)?;
     let devices = device::open_devices(&api);
     if devices.is_empty() {
-        return Err("device not found, check the udev rules".into());
+        return Err(if device::describe_interfaces(&api).is_empty() {
+            "device not found: is the dongle plugged in?".into()
+        } else {
+            "device found but it cannot be opened: install the udev rules (see README) and replug the dongle".into()
+        });
     }
 
     if opts.info {
