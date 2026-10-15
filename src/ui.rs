@@ -27,7 +27,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             Constraint::Min(10),   // Main content
             Constraint::Length(8), // Logs
         ])
-        .split(f.size());
+        .split(f.area());
 
     // Header
     let title = Paragraph::new(Line::from(vec![
