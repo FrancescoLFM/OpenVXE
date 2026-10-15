@@ -174,7 +174,7 @@ src/
 ## 4. Ordine di lavoro consigliato
 
 1. ✅ **Base solida** (completata): fix 1.3, 1.4, 1.10, clamp DPI a 12.750 (1.1 temporaneo), README + udev + LICENSE GPL-3.0 (3.3).
-2. **Refactor** in moduli + test del protocollo + CI (3.2, 3.4).
+2. ✅ **Refactor** (completata): moduli `protocol`/`device`/`app`/`ui`, 9 test del protocollo con byte di riferimento, CI GitHub Actions, clippy pulito con `-D warnings`, commenti in inglese, ratatui 0.30 + crossterm 0.29 (3.2, 3.4). Restano da 3.4: `anyhow`/`thiserror` (insieme alla gestione errori della fase 4); da 3.3: metadati `Cargo.toml` e rinomina del pacchetto in `openvxe`.
 3. **Reverse engineering**: sniffing del software ufficiale → `PROTOCOL.md`, lettura config (2.1), DPI alto (1.1), stadi DPI (2.2), sleep (1.6).
 4. **Robustezza**: filtro interfacce e gestione errori (1.5), hotplug (1.8), batteria `Option` + carica (1.7).
 5. **Feature utente**: profili (2.5), CLI (2.6), UX (2.7).
