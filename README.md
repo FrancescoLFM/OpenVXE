@@ -87,6 +87,8 @@ Settings are applied **live** to the mouse as soon as you change them.
 
 Contributions are welcome! See [ROADMAP.md](ROADMAP.md) for known bugs, missing features and planned work before opening an issue or pull request.
 
+Protocol knowledge lives in [docs/PROTOCOL.md](docs/PROTOCOL.md). To help confirm it on your mouse, see [docs/CAPTURE.md](docs/CAPTURE.md): the read-only `vxe-probe --info` and `vxe-probe --dump` commands are the easiest way to start.
+
 ## 📄 License
 
 OpenVXE is released under the **GNU General Public License v3.0**. See [LICENSE](LICENSE) for the full text.

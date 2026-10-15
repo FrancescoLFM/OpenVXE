@@ -16,6 +16,8 @@ Con DPI max 26.000 il valore è `520`, che troncato a `u8` diventa `8` → il mo
 Il protocollo quasi certamente prevede un byte alto (probabilmente `p[11]` o bit extra in un byte vicino) che va scoperto sniffando il software ufficiale a DPI > 12.750.
 Nel frattempo: limitare il clamp a 12.750 in `modify_setting` (`src/main.rs:258`).
 
+> **Aggiornamento fase 3** (vedi `docs/PROTOCOL.md`): i byte X/Y non sono `dpi / 50` in generale, la codifica dipende dal sensore (PAW3395SE usa una tabella di codici, CORE26K usa `dpi / 50 - 1` con i bit alti nel terzo byte dello stadio). Il pacchetto DPI scrive inoltre **due stadi** (stadio 1 fisso a codice 4). Serve `GetMouseCIDMID` (`vxe-probe --info`) per scegliere la codifica.
+
 ### 🔴 1.2 La UI mostra valori finti, non quelli del mouse
 `src/main.rs:154-161` — i settaggi partono da default hardcoded (800 DPI, 1000 Hz, ...). Non viene mai letta la configurazione reale.
 Conseguenze:
@@ -44,6 +46,8 @@ Fix: filtrare per `usage_page`/`interface_number` del canale vendor, usare un so
 `src/main.rs:112` — il pacchetto Motion Sync contiene anche il tempo di sleep, forzato a `0x05`. Chi aveva impostato un altro sleep dal software ufficiale lo perde silenziosamente.
 Fix: rendere lo sleep un settaggio vero (vedi 2.4) e inviare entrambi i valori correnti.
 
+> **Aggiornamento fase 3**: il pacchetto scrive 10 byte da `0xA9`. Oltre a motion sync imposta **debounce a 8 ms** e **sleep a 50 s** (unità da 10 s, non minuti), poi due coppie con complemento non valido su straight-line correction e ripple control. Va riscritto per inviare solo `0xAB`.
+
 ### 🟠 1.7 Batteria: 0% rosso prima della prima lettura
 `battery: 0` (`src/main.rs:151`) è indistinguibile da "batteria scarica". Usare `Option<u8>` e mostrare `--` / "In attesa…" finché non arriva la risposta. La formula `raw * 2` (`src/main.rs:202,204`) andrebbe verificata (step del 2%? scala 0–50?), e manca lo stato di carica.
 
@@ -64,6 +68,12 @@ I device vengono aperti una sola volta all'avvio. Se il mouse/dongle viene stacc
 - Loop a 16 ms che ridisegna sempre anche senza cambiamenti: ~60 redraw/s di CPU sprecata.
 
 ---
+
+### 🔴 1.12 Le scritture a `0x70` potrebbero sovrascrivere il tasto avanti
+Polling rate, LOD, debounce e angle snapping vengono scritti come record di 4 byte all'indirizzo `0x70`. Nella mappa EEPROM del vendor `0x70` è il record del **tasto avanti**, e questi record non hanno un checksum valido. Nessuna fonte oltre OpenVXE conferma lo schema "registri sensore" a `0x70`. Da verificare con `vxe-probe --dump --from 60 --to 78` prima e dopo aver cambiato uno di quei settaggi. Se confermato, usare gli indirizzi del vendor: `0x00` polling, `0x0A` LOD, `0xA9` debounce.
+
+### 🟠 1.13 La batteria usa il comando sbagliato
+La TUI interroga `0x17`, che per il vendor è `GetFarDistanceMode`. La batteria è `0x04`: percentuale diretta (senza ×2), flag di carica e tensione in mV. È verificata su `373b:1085` da un altro progetto. Da confermare con `vxe-probe --info`.
 
 ## 2. Feature mancanti
 
@@ -175,7 +185,10 @@ src/
 
 1. ✅ **Base solida** (completata): fix 1.3, 1.4, 1.10, clamp DPI a 12.750 (1.1 temporaneo), README + udev + LICENSE GPL-3.0 (3.3).
 2. ✅ **Refactor** (completata): moduli `protocol`/`device`/`app`/`ui`, 9 test del protocollo con byte di riferimento, CI GitHub Actions, clippy pulito con `-D warnings`, commenti in inglese, ratatui 0.30 + crossterm 0.29 (3.2, 3.4). Restano da 3.4: `anyhow`/`thiserror` (insieme alla gestione errori della fase 4); da 3.3: metadati `Cargo.toml` e rinomina del pacchetto in `openvxe`.
-3. **Reverse engineering**: sniffing del software ufficiale → `PROTOCOL.md`, lettura config (2.1), DPI alto (1.1), stadi DPI (2.2), sleep (1.6).
+3. 🟡 **Reverse engineering** (strumenti e documentazione pronti, manca la verifica sull'hardware):
+   - fatto: `docs/PROTOCOL.md` con fonti e livelli di confidenza, `docs/CAPTURE.md`, `vxe-decode`, `vxe-probe` (`--info`, `--dump` in sola lettura, allowlist dei comandi), sniffer su file (`OPENVXE_SNIFF`);
+   - da fare col mouse: `vxe-probe --info` e `--dump` per confermare batteria `0x04`, CID/MID (quindi la codifica DPI), la mappa EEPROM e il problema 1.12;
+   - poi: lettura config all'avvio (2.1), codifica DPI corretta (1.1), stadi DPI (2.2), fix 1.6, 1.12 e 1.13.
 4. **Robustezza**: filtro interfacce e gestione errori (1.5), hotplug (1.8), batteria `Option` + carica (1.7).
 5. **Feature utente**: profili (2.5), CLI (2.6), UX (2.7).
 6. **Espansione**: rimappatura tasti/macro (2.3), altri modelli/chipset, multipiattaforma, pacchetti.

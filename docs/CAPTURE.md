@@ -5,6 +5,24 @@ button remapping, sleep timer...) need protocol knowledge that can only come fro
 what the official configuration software sends to the mouse. This guide explains how to
 record that traffic and decode it with the tools in this repository.
 
+Much of the protocol is already documented in [PROTOCOL.md](PROTOCOL.md) from public
+sources; captures are mainly needed to **confirm** the entries marked ❓ there.
+
+## Start here: read-only checks
+
+These commands only read from the mouse and are safe to run:
+
+```bash
+./target/release/vxe-probe --list              # interfaces and usage pages
+./target/release/vxe-probe --info              # battery (0x04), CID/MID, firmware, 0x17
+./target/release/vxe-probe --dump              # configuration memory 0x0000-0x00C0
+```
+
+`--dump` is decoded with the EEPROM map: compare it with what the official software shows.
+To check whether the TUI's polling/LOD/debounce/angle-snap writes touch the forward button
+(see PROTOCOL.md), run `--dump --from 60 --to 78`, change one of those settings in the TUI,
+and dump again.
+
 > ⚠️ Before experimenting, write down (or screenshot) your current configuration in the
 > official software so you can restore it. Write commands change the mouse memory.
 
@@ -128,15 +146,16 @@ Each item is a separate short capture (or clearly separated by notes with timest
 ## Testing a hypothesis with `vxe-probe`
 
 ```bash
-./target/release/vxe-probe --list              # HID interfaces, usage pages
-./target/release/vxe-probe 17                  # battery query, prints the response
-./target/release/vxe-probe --feature 17        # also read feature report 0x08
+./target/release/vxe-probe 04                  # battery level query, prints the reply
+./target/release/vxe-probe 08 00 00 0c 08      # GetEEPROM: 8 bytes at 0x000C (DPI stages 1-2)
+./target/release/vxe-probe --feature 04        # also read feature report 0x08
 ./target/release/vxe-probe --listen 10000      # watch what the mouse sends (press DPI button)
 ./target/release/vxe-probe --yes 07 00 00 0c 08 04 04 00 4d 10 10 00 35   # write DPI 800
 ```
 
-The report ID `0x08` and the checksum are added automatically. Write commands (`0x07`)
-require `--yes`. Prefer replaying packets seen in a capture over guessing new ones.
+The report ID `0x08` and the checksum are added automatically. Any command that is not a
+known read (writes `0x07`, factory reset `0x09`, firmware upgrade mode `0x0D`, pairing...)
+requires `--yes`. Prefer replaying packets seen in a capture over guessing new ones.
 
 Please share interesting findings (decoded captures, not raw personal data) in an issue
 or directly as an update to [PROTOCOL.md](PROTOCOL.md).
