@@ -49,7 +49,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 The included rule gives the logged-in user access to the mouse's `hidraw` nodes, so the driver can run without `sudo`:
 ```bash
-sudo cp udev/99-openvxe.rules /etc/udev/rules.d/
+sudo cp udev/70-openvxe.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 Then unplug and replug the USB dongle.

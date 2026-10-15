@@ -155,7 +155,7 @@ src/
 
 ### 🟠 3.3 Packaging e installazione
 - Il README è troncato: il blocco ` ```bash ` non è chiuso, c'è un `# OpenVXE` duplicato, mancano le sezioni udev, build e utilizzo.
-- Fornire il file delle regole udev nel repo, es. `udev/99-openvxe.rules`:
+- Fornire il file delle regole udev nel repo, es. `udev/70-openvxe.rules`:
   ```
   KERNEL=="hidraw*", ATTRS{idVendor}=="373b", ATTRS{idProduct}=="1085", TAG+="uaccess"
   ```

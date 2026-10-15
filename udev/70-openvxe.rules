@@ -3,9 +3,11 @@
 # Grants the currently logged-in user (via systemd-logind "uaccess") read/write
 # access to the mouse's hidraw nodes, so vxe_driver can run without root.
 # No MODE="0660" is needed: uaccess adds a per-user ACL on the device node.
+# The file name must sort before 73-seat-late.rules, which applies the ACL to
+# devices already tagged "uaccess"; a 99- prefix would tag them too late.
 #
 # Install:
-#   sudo cp udev/99-openvxe.rules /etc/udev/rules.d/
+#   sudo cp udev/70-openvxe.rules /etc/udev/rules.d/
 #   sudo udevadm control --reload-rules && sudo udevadm trigger
 # Then unplug and replug the USB dongle.
 
