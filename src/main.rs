@@ -1,10 +1,11 @@
 mod app;
 mod ui;
 
+use anyhow::Context;
 use app::App;
 use crossterm::{
     cursor,
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -14,17 +15,16 @@ use ratatui::{
     Terminal,
 };
 use std::{io, time::Duration};
-use vxe_driver::device;
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, cursor::Show);
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, cursor::Show);
 }
 
-fn main() -> Result<(), io::Error> {
+fn main() -> anyhow::Result<()> {
     // Initialize HID before touching the terminal, so errors are printed normally.
-    let api = HidApi::new().map_err(io::Error::other)?;
-    let mut app = App::new(device::open_devices(&api));
+    let api = HidApi::new().context("cannot initialize HID")?;
+    let mut app = App::new(api);
 
     // Restore the terminal on panic, otherwise it stays in raw mode / alternate screen.
     let default_hook = std::panic::take_hook();
@@ -33,29 +33,12 @@ fn main() -> Result<(), io::Error> {
         default_hook(info);
     }));
 
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    if let Err(err) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
-        restore_terminal();
-        return Err(err);
-    }
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = match Terminal::new(backend) {
-        Ok(t) => t,
-        Err(err) => {
-            restore_terminal();
-            return Err(err);
-        }
-    };
-
-    let res = run_app(&mut terminal, &mut app);
-
+    enable_raw_mode().context("cannot enable raw mode")?;
+    let res = execute!(io::stdout(), EnterAlternateScreen)
+        .and_then(|()| Terminal::new(CrosstermBackend::new(io::stdout())))
+        .and_then(|mut terminal| run_app(&mut terminal, &mut app));
     restore_terminal();
-
-    if let Err(err) = res {
-        println!("{:?}", err)
-    }
-    Ok(())
+    res.context("terminal error")
 }
 
 fn run_app<B: Backend<Error = io::Error>>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {

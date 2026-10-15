@@ -1,8 +1,9 @@
 //! Send raw packets to the mouse and print its responses, to test protocol hypotheses.
 
+use anyhow::{anyhow, bail, Context};
 use hidapi::HidApi;
+use openvxe::{device, protocol};
 use std::time::{Duration, Instant};
-use vxe_driver::{device, protocol};
 
 const USAGE: &str = "Usage:
   vxe-probe --list                       List the HID interfaces of the mouse
@@ -40,7 +41,8 @@ struct Options {
     hex: Vec<String>,
 }
 
-fn parse_args() -> Result<Options, String> {
+/// Parse the command line; `None` means the usage should be printed.
+fn parse_args() -> anyhow::Result<Option<Options>> {
     let mut opts = Options {
         list: false,
         info: false,
@@ -54,14 +56,14 @@ fn parse_args() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "-h" | "--help" => return Err(String::new()),
+            "-h" | "--help" => return Ok(None),
             "--list" => opts.list = true,
             "--info" => opts.info = true,
             "--dump" => opts.dump = Some(opts.dump.unwrap_or((0x0000, 0x00c0))),
             "--from" | "--to" => {
-                let value = args.next().ok_or(format!("{} needs a value", arg))?;
+                let value = args.next().with_context(|| format!("{} needs a value", arg))?;
                 let addr = u16::from_str_radix(value.trim_start_matches("0x"), 16)
-                    .map_err(|_| format!("invalid address: {}", value))?;
+                    .with_context(|| format!("invalid address: {}", value))?;
                 let (from, to) = opts.dump.unwrap_or((0x0000, 0x00c0));
                 opts.dump = Some(if arg == "--from" { (addr, to) } else { (from, addr) });
             }
@@ -69,36 +71,41 @@ fn parse_args() -> Result<Options, String> {
             "--feature" => opts.feature = true,
             "--yes" => opts.yes = true,
             "--listen" => {
-                let ms = args.next().ok_or("--listen needs a value")?;
-                opts.listen_ms = ms.parse().map_err(|_| format!("invalid --listen value: {}", ms))?;
+                let ms = args.next().context("--listen needs a value")?;
+                opts.listen_ms = ms.parse().with_context(|| format!("invalid --listen value: {}", ms))?;
             }
             _ => opts.hex.push(arg),
         }
     }
-    Ok(opts)
+    let nothing_to_do = !opts.list
+        && !opts.info
+        && opts.dump.is_none()
+        && opts.hex.is_empty()
+        && !std::env::args().any(|a| a == "--listen");
+    Ok((!nothing_to_do).then_some(opts))
 }
 
-fn build(opts: &Options) -> Result<Option<protocol::Packet>, String> {
+fn build(opts: &Options) -> anyhow::Result<Option<protocol::Packet>> {
     if opts.hex.is_empty() {
         return Ok(None);
     }
-    let bytes = protocol::parse_hex(&opts.hex.join(" ")).ok_or("invalid hex payload")?;
+    let bytes = protocol::parse_hex(&opts.hex.join(" ")).context("invalid hex payload")?;
     let packet = if opts.raw {
         bytes
             .as_slice()
             .try_into()
-            .map_err(|_| format!("--raw needs exactly 17 bytes, got {}", bytes.len()))?
+            .map_err(|_| anyhow!("--raw needs exactly 17 bytes, got {}", bytes.len()))?
     } else {
-        protocol::build_packet(&bytes).ok_or(format!("payload too long: {} bytes (max 15)", bytes.len()))?
+        protocol::build_packet(&bytes).with_context(|| format!("payload too long: {} bytes (max 15)", bytes.len()))?
     };
     if packet[0] != protocol::REPORT_ID {
-        return Err(format!("report ID must be 0x{:02X}", protocol::REPORT_ID));
+        bail!("report ID must be 0x{:02X}", protocol::REPORT_ID);
     }
     if !READ_ONLY_COMMANDS.contains(&packet[1]) && !opts.yes {
-        return Err(format!(
+        bail!(
             "command 0x{:02X} is not a known read and may change the mouse state; add --yes to send it",
             packet[1]
-        ));
+        );
     }
     Ok(Some(packet))
 }
@@ -109,19 +116,19 @@ fn print_report(tag: &str, report: &[u8]) {
 }
 
 /// Send one request and return the matching reply (same command and address).
-fn request(devices: &[hidapi::HidDevice], packet: &protocol::Packet) -> Option<Vec<u8>> {
-    device::send(devices, packet);
+fn request(devices: &[hidapi::HidDevice], packet: &protocol::Packet) -> anyhow::Result<Option<Vec<u8>>> {
+    device::send(devices, packet)?;
     let start = Instant::now();
     while start.elapsed() < REPLY_TIMEOUT {
-        if let Some(report) = device::read_all(devices)
+        if let Some(report) = device::read_all(devices)?
             .into_iter()
             .find(|r| protocol::is_reply_to(packet, r))
         {
-            return Some(report);
+            return Ok(Some(report));
         }
         std::thread::sleep(Duration::from_millis(2));
     }
-    None
+    Ok(None)
 }
 
 fn print_reply(tag: &str, reply: Option<Vec<u8>>) {
@@ -131,7 +138,7 @@ fn print_reply(tag: &str, reply: Option<Vec<u8>>) {
     }
 }
 
-fn info(devices: &[hidapi::HidDevice]) {
+fn info(devices: &[hidapi::HidDevice]) -> anyhow::Result<()> {
     for cmd in [
         protocol::CMD_BATTERY_LEVEL,
         protocol::CMD_GET_CID_MID,
@@ -139,19 +146,20 @@ fn info(devices: &[hidapi::HidDevice]) {
         0x17, // GetFarDistanceMode (used as battery query by OpenVXE before 0.2)
     ] {
         let packet = protocol::build_packet(&[cmd]).expect("one byte payload");
-        print_reply(&format!("[0x{:02X}]", cmd), request(devices, &packet));
+        print_reply(&format!("[0x{:02X}]", cmd), request(devices, &packet)?);
     }
+    Ok(())
 }
 
 /// Read the EEPROM range in chunks, print a hex dump and decode each contiguous run of
 /// successfully read bytes as a whole, so records are not split at chunk boundaries.
-fn dump(devices: &[hidapi::HidDevice], from: u16, to: u16) -> Result<(), String> {
+fn dump(devices: &[hidapi::HidDevice], from: u16, to: u16) -> anyhow::Result<()> {
     let mut missing = 0;
     let mut segments: Vec<(u16, Vec<u8>)> = Vec::new();
     let mut addr = from;
     while addr < to {
         let len = (to - addr).min(protocol::EEPROM_CHUNK as u16) as u8;
-        match request(devices, &protocol::eeprom_read(addr, len)) {
+        match request(devices, &protocol::eeprom_read(addr, len))? {
             Some(report) if protocol::reply_status(&report) == Some(0) => {
                 let data = protocol::reply_data(&report).unwrap_or_default();
                 match segments.last_mut() {
@@ -180,16 +188,16 @@ fn dump(devices: &[hidapi::HidDevice], from: u16, to: u16) -> Result<(), String>
         }
     }
     if missing > 0 {
-        return Err(format!(
+        bail!(
             "incomplete dump: {} chunk(s) not read (mouse asleep? move it and retry)",
             missing
-        ));
+        );
     }
     Ok(())
 }
 
-fn run(opts: Options) -> Result<(), String> {
-    let api = HidApi::new().map_err(|e| e.to_string())?;
+fn run(opts: Options) -> anyhow::Result<()> {
+    let api = HidApi::new().context("cannot initialize HID")?;
     if opts.list {
         for line in device::describe_interfaces(&api) {
             println!("{}", line);
@@ -198,18 +206,10 @@ fn run(opts: Options) -> Result<(), String> {
     }
 
     let packet = build(&opts)?;
-    let devices = device::open_devices(&api);
-    if devices.is_empty() {
-        return Err(if device::describe_interfaces(&api).is_empty() {
-            "device not found: is the dongle plugged in?".into()
-        } else {
-            "device found but it cannot be opened: install the udev rules (see README) and replug the dongle".into()
-        });
-    }
+    let devices = device::open_devices(&api)?;
 
     if opts.info {
-        info(&devices);
-        return Ok(());
+        return info(&devices);
     }
     if let Some((from, to)) = opts.dump {
         return dump(&devices, from, to);
@@ -217,13 +217,13 @@ fn run(opts: Options) -> Result<(), String> {
 
     if let Some(packet) = packet {
         print_report("TX", &packet);
-        device::send(&devices, &packet);
+        device::send(&devices, &packet)?;
     }
 
     let start = Instant::now();
     let listen = Duration::from_millis(opts.listen_ms);
     while start.elapsed() < listen {
-        for report in device::read_all(&devices) {
+        for report in device::read_all(&devices)? {
             // Skip standard mouse input reports.
             if report.first().is_some_and(|&id| id == 0x01 || id == 0x02) {
                 continue;
@@ -241,24 +241,12 @@ fn run(opts: Options) -> Result<(), String> {
     Ok(())
 }
 
-fn main() {
-    let result = parse_args().and_then(|opts| {
-        if !opts.list
-            && !opts.info
-            && opts.dump.is_none()
-            && opts.hex.is_empty()
-            && !std::env::args().any(|a| a == "--listen")
-        {
-            return Err(String::new());
-        }
-        run(opts)
-    });
-    if let Err(msg) = result {
-        if msg.is_empty() {
+fn main() -> anyhow::Result<()> {
+    match parse_args()? {
+        Some(opts) => run(opts),
+        None => {
             println!("{}", USAGE);
-        } else {
-            eprintln!("Error: {}", msg);
-            std::process::exit(1);
+            Ok(())
         }
     }
 }

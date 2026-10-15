@@ -3,8 +3,8 @@
 //! Reads text lines (a file or stdin) such as `tshark -T fields` output or the
 //! OpenVXE sniffer log, finds the hex data on each line and prints the decoded packet.
 
+use openvxe::protocol;
 use std::io::{self, BufRead, BufReader};
-use vxe_driver::protocol;
 
 const USAGE: &str = "Usage: vxe-decode [FILE]
 

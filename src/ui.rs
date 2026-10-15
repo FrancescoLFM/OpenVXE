@@ -1,6 +1,7 @@
 //! Rendering.
 
 use crate::app::App;
+use openvxe::config::{Setting, MAX_DPI};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
@@ -8,7 +9,6 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
     Frame,
 };
-use vxe_driver::config::{Setting, MAX_DPI};
 
 fn panel(title: &str) -> Block<'_> {
     Block::default()
@@ -21,7 +21,7 @@ fn panel(title: &str) -> Block<'_> {
 fn status(app: &App) -> (String, Color) {
     let pending = app.pending_writes();
     if app.devices.is_empty() {
-        ("Device not found".into(), Color::Red)
+        ("Dongle not connected: plug it in".into(), Color::Red)
     } else if app.asleep && app.config.is_none() {
         ("Waiting for the mouse: move it to wake it up".into(), Color::Yellow)
     } else if app.asleep {

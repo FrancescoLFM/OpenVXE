@@ -31,6 +31,10 @@ On `373b:1085` hidapi lists one entry per top-level collection of the same hidra
 interface 0. OpenVXE opens each path once, only if it exposes a vendor usage page. 🟢
 Run `vxe-probe --list` to see the interfaces and usage pages of your device.
 
+Requests can be sent either as an output report or as a feature report: the mouse answers
+both with the same input report 🟢. OpenVXE sends output reports only, like the official
+WebHID software.
+
 ## Frame
 
 Output report ID `0x08`, 16-byte payload:
@@ -162,6 +166,9 @@ PAW3395SE, asking 1600 DPI wrote code `0x20` = **1400 DPI**, and stage 1 was for
 4. A write is done when the mouse echoes it (~80 ms). Writes to the same block that are
    still queued are merged. If the mouse rejects a write, the block is read back so the UI
    matches the EEPROM again.
+5. A read or write error means the dongle is gone: the device is closed, everything read
+   from it is forgotten, and the dongle is looked for again every 2 seconds. On reconnect the
+   startup reads run again. 🟢 Tested by unplugging and replugging the dongle.
 
 🟢 Tested from the TUI: polling 1000 → 500 → 1000 Hz, both writes echoed, the final
 EEPROM identical to the backup (all 192 bytes).

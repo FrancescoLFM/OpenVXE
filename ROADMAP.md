@@ -40,13 +40,15 @@ Fix: inizializzare HID prima di entrare in raw mode, gestire gli errori con `?`/
 `src/main.rs:152` — `Instant::now() - Duration::from_secs(60)`. Su Linux `Instant` è basato su `CLOCK_MONOTONIC` (parte dal boot): se il programma parte entro 60 s dal boot la sottrazione va in underflow → panic.
 Fix: `Instant::now().checked_sub(...)` oppure usare `Option<Instant>` per "mai richiesto".
 
-### 🟠 1.5 Ogni comando viene inviato 2× a ogni interfaccia, errori ignorati
+### ✅ 1.5 Ogni comando viene inviato 2× a ogni interfaccia, errori ignorati (risolto)
 `src/main.rs:72-75` — per ogni device si chiama sia `write()` sia `send_feature_report()`, scartando i risultati. Inoltre vengono aperte **tutte** le interfacce HID con quel VID/PID (`src/main.rs:140-147`), incluse quelle di input standard.
 Problemi:
 - comandi duplicati (innocui solo finché il firmware è idempotente);
 - il log scrive `TX: Applied ...` (`src/main.rs:270`) anche se ogni scrittura è fallita.
 
 Fix: filtrare per `usage_page`/`interface_number` del canale vendor, usare un solo metodo di invio, propagare l'errore e mostrarlo nel log.
+
+> **Fase 5**: verificato sul mouse che output report e feature report funzionano entrambi; ora si usa solo l'output report (`write`, come il software ufficiale via WebHID). Errori di invio e lettura propagati con `DeviceError` (`thiserror`).
 
 ### ✅ 1.6 Motion Sync sovrascrive il timer di sleep (risolto)
 `src/main.rs:112` — il pacchetto Motion Sync contiene anche il tempo di sleep, forzato a `0x05`. Chi aveva impostato un altro sleep dal software ufficiale lo perde silenziosamente.
@@ -59,10 +61,12 @@ Fix: rendere lo sleep un settaggio vero (vedi 2.4) e inviare entrambi i valori c
 ### ✅ 1.7 Batteria: 0% rosso prima della prima lettura (risolto: "Waiting...", stato di carica mostrato)
 `battery: 0` (`src/main.rs:151`) è indistinguibile da "batteria scarica". Usare `Option<u8>` e mostrare `--` / "In attesa…" finché non arriva la risposta. La formula `raw * 2` (`src/main.rs:202,204`) andrebbe verificata (step del 2%? scala 0–50?), e manca lo stato di carica.
 
-### 🟠 1.8 Nessuna gestione di disconnessione / hotplug
+### ✅ 1.8 Nessuna gestione di disconnessione / hotplug (risolto)
 I device vengono aperti una sola volta all'avvio. Se il mouse/dongle viene staccato o va in sleep, l'app continua a scrivere nel vuoto; se il mouse viene collegato dopo l'avvio non verrà mai trovato. Serve un ri-scan periodico (es. ogni 2 s se `devices` è vuoto o se `read` restituisce errore).
 
-### 🟢 1.9 Mouse capture abilitato senza motivo
+> **Fase 5**: un errore di lettura o scrittura chiude il device e azzera lo stato letto (config, batteria, firmware), avvisando se c'erano modifiche non applicate. Ogni 2 s si cerca di nuovo il dongle e alla riconnessione la config viene riletta. Testato staccando e riattaccando il dongle.
+
+### ✅ 1.9 Mouse capture abilitato senza motivo (risolto: rimosso)
 `src/main.rs:133` — `EnableMouseCapture` ma nessun evento mouse è gestito. Effetto collaterale: nel terminale non si può più selezionare/copiare il testo (es. i log hex del sniffer). Rimuovere o implementare click/scroll.
 
 ### 🟢 1.10 Eventi tastiera non filtrati per `KeyEventKind`
@@ -165,22 +169,22 @@ src/
 ```
 `protocol.rs` senza dipendenze da HID permette test unitari su ogni pacchetto (confronto con dump reali del software ufficiale). Un trait `Transport` permette un mock per i test end-to-end.
 
-### 🟠 3.3 Packaging e installazione
+### 🟠 3.3 Packaging e installazione (in parte risolto)
 - Il README è troncato: il blocco ` ```bash ` non è chiuso, c'è un `# OpenVXE` duplicato, mancano le sezioni udev, build e utilizzo.
 - Fornire il file delle regole udev nel repo, es. `udev/70-openvxe.rules`:
   ```
   KERNEL=="hidraw*", ATTRS{idVendor}=="373b", ATTRS{idProduct}=="1085", TAG+="uaccess"
   ```
 - Pacchetto AUR (`openvxe` / `openvxe-git`), magari anche `.deb`/Flatpak.
-- `Cargo.toml`: il nome è `vxe_driver` (binario `vxe_driver`), meglio `openvxe`; aggiungere `description`, `license`, `repository`, `readme`.
+- ✅ `Cargo.toml`: il nome è `vxe_driver` (binario `vxe_driver`), meglio `openvxe`; aggiungere `description`, `license`, `repository`, `readme`. (Fase 5: pacchetto, libreria e binario rinominati `openvxe`, licenza `GPL-3.0-only`, `rust-version` 1.88 come ratatui 0.30.)
 - Aggiungere un file `LICENSE` (il README dice "open-source" ma non c'è licenza → legalmente nessuno può contribuire/redistribuire).
 
-### 🟠 3.4 CI e pulizia codice
+### ✅ 3.4 CI e pulizia codice (risolto)
 - GitHub Actions: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, build release.
 - Clippy oggi segnala 3 warning: `upper_case_acronyms` (`DPI`, `LOD` → `Dpi`, `Lod`) e `inherent_to_string` (implementare `Display` per `Setting`).
 - I commenti nel codice sono in russo (`src/main.rs:200,206,278,...`): tradurli in inglese per i contributori.
 - Aggiornare le dipendenze (`ratatui 0.26` → ultima, che porta crossterm più recente).
-- Usare `anyhow`/`thiserror` per gli errori.
+- ✅ Usare `anyhow`/`thiserror` per gli errori (fase 5: `thiserror` nella libreria, `anyhow` nei binari).
 
 ### 🟢 3.5 Multipiattaforma
 `hidapi` funziona anche su Windows e macOS: con le fix 1.10 e il filtro per interfaccia, il supporto è quasi gratis. Su Windows serve l'interfaccia vendor corretta perché le interfacce mouse sono bloccate dal sistema.
@@ -211,8 +215,13 @@ src/
    - settaggi: stadi DPI (codici PAW3395SE), numero di stadi, stadio attivo, polling 125–1000 Hz, LOD, debounce, motion sync, sleep, angle snapping, ripple control;
    - ✅ testata sull'hardware: polling 1000→500→1000 Hz dalla TUI, entrambe le scritture confermate dall'eco, EEPROM finale identica al backup (192 byte);
    - risolti 1.1 (per PAW3395SE), 1.2, 1.6, 1.12, 2.1, 2.2.
-5. **Robustezza** (prossima): gestione errori con `anyhow`/`thiserror` (1.5, 3.4), hotplug (1.8), mouse capture (1.9), metadati `Cargo.toml` (3.3).
-6. **Feature utente**: profili (2.5), CLI (2.6), UX (2.7).
+5. ✅ **Robustezza** (completata):
+   - errori tipizzati con `thiserror` (`DeviceError`, `ConfigError`), `anyhow` in `openvxe` e `vxe-probe`;
+   - invio solo come output report, errori di invio/lettura propagati (1.5);
+   - hotplug: disconnessione rilevata, ri-scan ogni 2 s, config riletta alla riconnessione (1.8), ✅ testato staccando il dongle;
+   - mouse capture rimosso, il testo del terminale si può di nuovo selezionare (1.9);
+   - pacchetto rinominato `openvxe`, metadati `Cargo.toml` (3.3, 3.4).
+6. **Feature utente** (prossima): profili (2.5), CLI (2.6), UX (2.7).
 7. **Espansione**: rimappatura tasti/macro (2.3), altri modelli/chipset, multipiattaforma, pacchetti.
 
 Ogni punto è un buon candidato per una PR separata e piccola.

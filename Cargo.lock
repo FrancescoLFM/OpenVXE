@@ -756,6 +756,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "openvxe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "hidapi",
+ "ratatui",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "ordered-float"
 version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1563,15 +1574,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d9b2acfb050df409c972a37d3b8e08cdea3bddb0c09db9d53137e504cfabed0"
 dependencies = [
  "utf8parse",
-]
-
-[[package]]
-name = "vxe_driver"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "hidapi",
- "ratatui",
 ]
 
 [[package]]

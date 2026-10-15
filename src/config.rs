@@ -124,11 +124,20 @@ pub struct Config {
     bytes: Vec<u8>,
 }
 
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ConfigError {
+    #[error("expected {expected} bytes, got {got}")]
+    WrongSize { expected: usize, got: usize },
+}
+
 impl Config {
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, String> {
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, ConfigError> {
         let expected = (IMAGE_END - IMAGE_START) as usize;
         if bytes.len() != expected {
-            return Err(format!("expected {} bytes, got {}", expected, bytes.len()));
+            return Err(ConfigError::WrongSize {
+                expected,
+                got: bytes.len(),
+            });
         }
         Ok(Config { bytes })
     }

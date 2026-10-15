@@ -4,19 +4,21 @@
 //! (writes are acknowledged by their echo). Without a reply the mouse is considered asleep
 //! and the request is retried until it wakes up, so changes are never silently lost.
 
-use hidapi::HidDevice;
+use hidapi::{HidApi, HidDevice};
+use openvxe::config::{self, Config, Setting};
+use openvxe::device::{self, DeviceError};
+use openvxe::protocol::{self, Packet, Report};
 use ratatui::widgets::ListState;
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::time::{Duration, Instant};
-use vxe_driver::config::{self, Config, Setting};
-use vxe_driver::device;
-use vxe_driver::protocol::{self, Packet, Report};
 
 const MAX_LOG_LINES: usize = 6;
 const BATTERY_INTERVAL: Duration = Duration::from_secs(10);
 const REPLY_TIMEOUT: Duration = Duration::from_millis(300);
+/// Wait between scans for the dongle while it is not connected.
+const RESCAN_INTERVAL: Duration = Duration::from_secs(2);
 /// Unanswered attempts after which the mouse is considered asleep.
 const ATTEMPTS_BEFORE_ASLEEP: u8 = 2;
 /// Wait between attempts while the mouse is asleep.
@@ -57,7 +59,11 @@ impl Request {
 }
 
 pub struct App {
+    api: HidApi,
     pub devices: Vec<HidDevice>,
+    last_scan: Option<Instant>,
+    /// Last connection error, logged once instead of at every scan.
+    last_scan_error: Option<String>,
     /// Battery percentage and charging state, `None` until the first reply.
     pub battery: Option<(u8, bool)>,
     last_battery_req: Option<Instant>,
@@ -81,9 +87,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(devices: Vec<HidDevice>) -> Self {
+    pub fn new(api: HidApi) -> Self {
         let mut app = App {
-            devices,
+            api,
+            devices: Vec::new(),
+            last_scan: None,
+            last_scan_error: None,
             battery: None,
             last_battery_req: None,
             state: ListState::default(),
@@ -112,17 +121,60 @@ impl App {
             }
         }
 
-        if app.devices.is_empty() {
-            app.log("Error: Device not found. Please check udev rules.".to_string());
-        } else {
-            app.log(format!(
-                "System: Connected to VXE R1 SE+ ({} interface(s)), reading configuration...",
-                app.devices.len()
-            ));
-            app.enqueue_startup_reads();
-        }
+        app.connect();
         app.state.select(Some(0));
         app
+    }
+
+    /// Look for the dongle and, once it is open, start reading the configuration.
+    fn connect(&mut self) {
+        self.last_scan = Some(Instant::now());
+        let result = self
+            .api
+            .refresh_devices()
+            .map_err(DeviceError::from)
+            .and_then(|()| device::open_devices(&self.api));
+        match result {
+            Ok(devices) => {
+                self.devices = devices;
+                self.last_scan_error = None;
+                self.log(format!(
+                    "System: Connected to VXE R1 SE+ ({} interface(s)), reading configuration...",
+                    self.devices.len()
+                ));
+                self.enqueue_startup_reads();
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                if self.last_scan_error.as_ref() != Some(&msg) {
+                    self.log(format!("Error: {}", msg));
+                    self.last_scan_error = Some(msg);
+                }
+            }
+        }
+    }
+
+    /// Forget the device and everything read from it, then wait for it to come back.
+    fn disconnect(&mut self, err: DeviceError) {
+        let lost = self.pending_writes();
+        self.devices.clear();
+        self.queue.clear();
+        self.in_flight = None;
+        self.retry_after = None;
+        self.asleep = false;
+        self.image.clear();
+        self.config = None;
+        self.items.clear();
+        self.cid_mid = None;
+        self.firmware = None;
+        self.battery = None;
+        self.last_battery_req = None;
+        self.quit_warned = false;
+        self.last_scan = Some(Instant::now());
+        self.log(format!("Error: Device disconnected ({}).", err));
+        if lost > 0 {
+            self.log(format!("Warning: {} change(s) not applied.", lost));
+        }
     }
 
     fn enqueue_startup_reads(&mut self) {
@@ -156,9 +208,9 @@ impl App {
         }
     }
 
-    fn send(&mut self, packet: &Packet) {
-        device::send(&self.devices, packet);
+    fn send(&mut self, packet: &Packet) -> Result<(), DeviceError> {
         self.sniff("TX", packet);
+        device::send(&self.devices, packet)
     }
 
     pub fn dpi_editable(&self) -> bool {
@@ -181,6 +233,9 @@ impl App {
     /// Queue periodic requests, process replies, handle timeouts and send the next request.
     pub fn poll_device(&mut self) {
         if self.devices.is_empty() {
+            if self.last_scan.is_none_or(|t| t.elapsed() >= RESCAN_INTERVAL) {
+                self.connect();
+            }
             return;
         }
 
@@ -195,7 +250,11 @@ impl App {
             self.last_battery_req = Some(Instant::now());
         }
 
-        for report in device::read_all(&self.devices) {
+        let reports = match device::read_all(&self.devices) {
+            Ok(reports) => reports,
+            Err(err) => return self.disconnect(err),
+        };
+        for report in reports {
             if matches!(report.first(), Some(0x01 | 0x02)) {
                 continue;
             }
@@ -233,7 +292,10 @@ impl App {
         let ready = self.retry_after.is_none_or(|t| Instant::now() >= t);
         if self.in_flight.is_none() && ready {
             if let Some(request) = self.queue.pop_front() {
-                self.send(&request.packet);
+                if let Err(err) = self.send(&request.packet) {
+                    self.queue.push_front(request);
+                    return self.disconnect(err);
+                }
                 self.in_flight = Some((request, Instant::now()));
             }
         }

@@ -20,6 +20,7 @@ An open-source, lightweight, and blazing-fast TUI (Terminal User Interface) driv
   * Sleep timer (30 s - 30 min)
   * Angle Snapping (On/Off) and Ripple Control (On/Off)
 * **Sleep aware:** while the mouse sleeps the dongle doesn't answer; changes are queued and sent when it wakes up.
+* **Hotplug:** the dongle can be unplugged and plugged back in (or plugged in after starting OpenVXE); the configuration is read again on reconnect.
 * **Real-time Battery Monitor:** battery level and charging state read with the vendor `GetBatteryLevel` command.
 * **Hex Sniffer:** Built-in packet monitor for debugging hardware responses.
 
@@ -60,7 +61,7 @@ Then unplug and replug the USB dongle.
 
 ```bash
 cargo build --release
-./target/release/vxe_driver
+./target/release/openvxe
 ```
 
 ## 🎮 Usage
@@ -77,13 +78,16 @@ Settings are read from the mouse at startup and applied **live** as soon as you 
 
 ## 🛠️ Troubleshooting
 
-**"Device not found"**
-* Make sure the udev rules are installed and reloaded (see step 2), then replug the dongle.
-* Check that the mouse/dongle is detected by the system:
+**"Dongle not connected" / "device not found"**
+* OpenVXE looks for the dongle every 2 seconds, so plugging it in is enough.
+* Check that the dongle is detected by the system:
   ```bash
   lsusb | grep 373b
   ```
-  If nothing shows up, try a different USB port or cable.
+  If nothing shows up, try a different USB port.
+
+**"device found but it cannot be opened"**
+* Make sure the udev rules are installed and reloaded (see step 2), then replug the dongle.
 
 **"Waiting for the mouse: move it to wake it up"**
 * The mouse is asleep and the dongle doesn't answer. Move it or click a button.
