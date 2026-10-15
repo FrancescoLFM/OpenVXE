@@ -1,6 +1,4 @@
 mod app;
-mod device;
-mod protocol;
 mod ui;
 
 use app::App;
@@ -16,6 +14,7 @@ use ratatui::{
     Terminal,
 };
 use std::{io, time::Duration};
+use vxe_driver::device;
 
 fn restore_terminal() {
     let _ = disable_raw_mode();

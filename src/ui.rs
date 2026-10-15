@@ -1,7 +1,6 @@
 //! Rendering.
 
 use crate::app::App;
-use crate::protocol::MAX_DPI;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
@@ -9,6 +8,7 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
     Frame,
 };
+use vxe_driver::protocol::MAX_DPI;
 
 fn panel(title: &str) -> Block<'_> {
     Block::default()

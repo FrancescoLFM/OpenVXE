@@ -13,8 +13,8 @@ pub const MAX_DPI: u16 = 12750;
 pub const MIN_DPI: u16 = 50;
 pub const DPI_STEP: u16 = 50;
 
-const REPORT_ID: u8 = 0x08;
-const CMD_WRITE: u8 = 0x07;
+pub const REPORT_ID: u8 = 0x08;
+pub const CMD_WRITE: u8 = 0x07;
 const CMD_BATTERY: u8 = 0x17;
 
 /// Every value byte is followed by its complement `0x55 - value`.
@@ -159,6 +159,142 @@ pub fn parse_report(buf: &[u8]) -> Report {
     }
 }
 
+pub fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ")
+}
+
+/// Parse hex bytes such as `07 00 0c`, `07:00:0c`, `0x07,0x00` or `07000c`.
+pub fn parse_hex(s: &str) -> Option<Vec<u8>> {
+    let digits: String = s
+        .split([' ', '\t', ':', ',', '-'])
+        .map(|t| t.trim_start_matches("0x").trim_start_matches("0X"))
+        .collect();
+    if digits.is_empty() || !digits.len().is_multiple_of(2) || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..digits.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&digits[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// Build a packet from up to 15 payload bytes, padding with zeros and appending the checksum.
+pub fn build_packet(payload: &[u8]) -> Option<Packet> {
+    if payload.len() > 15 {
+        return None;
+    }
+    let mut p = [0u8; 16];
+    p[..payload.len()].copy_from_slice(payload);
+    Some(finish(p))
+}
+
+/// Extract the 16-byte payload from a report, with or without the leading report ID.
+fn payload_of(bytes: &[u8]) -> Option<[u8; 16]> {
+    let start = if bytes.len() >= 17 && bytes[0] == REPORT_ID {
+        1
+    } else {
+        0
+    };
+    bytes.get(start..start + 16)?.try_into().ok()
+}
+
+/// Value bytes in `data` that are followed by their `0x55 - v` complement.
+fn complemented_values(data: &[u8]) -> Vec<u8> {
+    let mut values = Vec::new();
+    let mut i = 0;
+    while i + 1 < data.len() {
+        if data[i + 1] == complement(data[i]) {
+            values.push(data[i]);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    values
+}
+
+fn on_off(v: u8) -> &'static str {
+    if v != 0 {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+/// Human-readable description of a vendor packet, for the sniffer and the capture decoder.
+///
+/// Known commands are decoded; unknown ones are split into command/address/length/data,
+/// and value/complement pairs are highlighted to help reverse engineering.
+pub fn describe(bytes: &[u8]) -> String {
+    let Some(p) = payload_of(bytes) else {
+        return format!("short report ({} bytes)", bytes.len());
+    };
+    let bad_checksum = if checksum(&p) == p[15] { "" } else { " [bad checksum]" };
+    let addr = u16::from_be_bytes([p[2], p[3]]);
+    let len = p[4] as usize;
+    let data = &p[5..(5 + len).min(15)];
+
+    let values = complemented_values(data);
+    let values = if values.is_empty() {
+        String::new()
+    } else {
+        format!(" values=[{}]", to_hex(&values))
+    };
+
+    let body = match p[0] {
+        CMD_BATTERY if p[1..15].iter().all(|&b| b == 0) => "BATTERY query".to_string(),
+        CMD_BATTERY => format!(
+            "BATTERY response raw={} ({}%) [{}]",
+            p[4],
+            p[4].saturating_mul(2).min(100),
+            to_hex(&p[1..15])
+        ),
+        CMD_WRITE => {
+            let known = match (addr, data) {
+                (0x0c, _) => format!(
+                    "DPI X={} Y={} (p[11]=0x{:02X}, suspected high byte)",
+                    p[9] as u32 * DPI_STEP as u32,
+                    p[10] as u32 * DPI_STEP as u32,
+                    p[11]
+                ),
+                (0x70, [0x01, v, ..]) => format!("angle snapping {}", on_off(*v)),
+                (0x70, [0x02, v, ..]) => format!("debounce {} ms", v),
+                (0x70, [0x03, v, ..]) => format!("LOD {}", v),
+                (0x70, [0x0b, v, ..]) => format!(
+                    "polling rate {}",
+                    match v {
+                        0x01 => "1000 Hz",
+                        0x02 => "500 Hz",
+                        0x03 => "250 Hz",
+                        _ => "unknown",
+                    }
+                ),
+                (0x70, [reg, v, ..]) => format!("unknown sensor register 0x{:02X} = 0x{:02X}", reg, v),
+                (0xa9, _) => format!("motion sync {}, sleep {} min", on_off(p[7]), p[9]),
+                _ => "unknown address".to_string(),
+            };
+            format!(
+                "WRITE addr=0x{:04X} len={} data=[{}] -> {}{}",
+                addr,
+                len,
+                to_hex(data),
+                known,
+                values
+            )
+        }
+        cmd => format!(
+            "CMD 0x{:02X} p1=0x{:02X} addr=0x{:04X} len={} data=[{}]{}",
+            cmd,
+            p[1],
+            addr,
+            len,
+            to_hex(data),
+            values
+        ),
+    };
+    format!("{}{}", body, bad_checksum)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +406,49 @@ mod tests {
         let mut sync = Setting::MotionSync(true);
         sync.adjust(-1);
         assert_eq!(sync, Setting::MotionSync(false));
+    }
+
+    #[test]
+    fn parse_hex_formats() {
+        let expected = Some(vec![0x07, 0x00, 0x0c]);
+        assert_eq!(parse_hex("07 00 0c"), expected);
+        assert_eq!(parse_hex("07:00:0C"), expected);
+        assert_eq!(parse_hex("0x07,0x00,0x0c"), expected);
+        assert_eq!(parse_hex("07000c"), expected);
+        assert_eq!(parse_hex("070"), None);
+        assert_eq!(parse_hex("zz"), None);
+        assert_eq!(parse_hex(""), None);
+    }
+
+    #[test]
+    fn build_packet_pads_and_checksums() {
+        assert_eq!(build_packet(&[0x17]), Some(battery_request()));
+        assert_eq!(build_packet(&[0; 16]), None);
+    }
+
+    #[test]
+    fn describe_known_packets() {
+        let dpi = describe(&encode_setting(&Setting::Dpi(1600)));
+        assert!(dpi.contains("DPI X=1600 Y=1600"), "{dpi}");
+        assert!(!dpi.contains("bad checksum"));
+
+        assert!(describe(&encode_setting(&Setting::PollingRate(500))).contains("polling rate 500 Hz"));
+        assert!(describe(&encode_setting(&Setting::Debounce(7))).contains("debounce 7 ms"));
+        assert!(describe(&encode_setting(&Setting::MotionSync(true))).contains("motion sync on, sleep 5 min"));
+        assert_eq!(describe(&battery_request()), "BATTERY query");
+        // Without the report ID, as some capture tools export it.
+        assert!(describe(&encode_setting(&Setting::Lod(2))[1..]).contains("LOD 2"));
+    }
+
+    #[test]
+    fn describe_unknown_packets() {
+        let unknown = describe(&build_packet(&[0x08, 0x00, 0x00, 0x0c, 0x02, 0x10, 0x45]).unwrap());
+        assert_eq!(unknown, "CMD 0x08 p1=0x00 addr=0x000C len=2 data=[10 45] values=[10]");
+
+        let mut corrupted = encode_setting(&Setting::Dpi(800));
+        corrupted[16] ^= 0xff;
+        assert!(describe(&corrupted).ends_with("[bad checksum]"));
+        assert_eq!(describe(&[0x08, 0x07]), "short report (2 bytes)");
     }
 
     #[test]
