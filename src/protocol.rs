@@ -15,7 +15,6 @@ pub const DPI_STEP: u16 = 50;
 
 pub const REPORT_ID: u8 = 0x08;
 pub const CMD_WRITE: u8 = 0x07;
-const CMD_BATTERY: u8 = 0x17;
 
 /// Every value byte is followed by its complement `0x55 - value`.
 const VALUE_KEY: u8 = 0x55;
@@ -131,31 +130,59 @@ pub fn encode_setting(setting: &Setting) -> Packet {
     }
 }
 
+/// GetBatteryLevel query (`0x04`), verified on the `373b:1085` dongle.
 pub fn battery_request() -> Packet {
-    finish([CMD_BATTERY, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    finish([CMD_BATTERY_LEVEL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+}
+
+/// DPI codes of the PAW3395SE sensor (CID/MID 2,31): 50-10,000 DPI in 50 DPI steps are
+/// mapped to codes 1-235, skipping these codes. Verified on hardware for 400, 800, 1600
+/// and 3200 DPI; values above 10,000 use an extra flag in the `ex` byte (not supported yet).
+const PAW3395_SKIPPED_CODES: [u8; 35] = [
+    7, 13, 20, 26, 33, 40, 46, 53, 60, 66, 73, 80, 86, 93, 100, 106, 113, 120, 126, 133, 140, 146, 153, 160, 166, 173,
+    180, 186, 193, 200, 206, 213, 220, 226, 233,
+];
+
+/// PAW3395SE code for `dpi` (a multiple of 50 between 50 and 10,000).
+pub fn paw3395_code(dpi: u16) -> Option<u8> {
+    if !(50..=10_000).contains(&dpi) || !dpi.is_multiple_of(50) {
+        return None;
+    }
+    (1..=235u8)
+        .filter(|c| !PAW3395_SKIPPED_CODES.contains(c))
+        .nth((dpi / 50 - 1) as usize)
+}
+
+/// DPI value of a PAW3395SE code, if the code is valid.
+pub fn paw3395_dpi(code: u8) -> Option<u16> {
+    if code == 0 || code > 235 || PAW3395_SKIPPED_CODES.contains(&code) {
+        return None;
+    }
+    let skipped_below = PAW3395_SKIPPED_CODES.iter().filter(|&&c| c < code).count() as u16;
+    Some((code as u16 - skipped_below) * 50)
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Report {
     /// Standard mouse/keyboard input or too short to be a vendor response.
     Ignored,
-    /// Battery level in percent.
-    Battery(u8),
+    /// Battery level in percent and charging state.
+    Battery { percent: u8, charging: bool },
     /// Any other vendor response, kept for the hex sniffer.
     Unknown,
 }
 
 pub fn parse_report(buf: &[u8]) -> Report {
-    if buf.is_empty() || buf[0] == 0x01 || buf[0] == 0x02 || buf.len() <= 8 {
+    if matches!(buf.first(), None | Some(0x01 | 0x02)) {
         return Report::Ignored;
     }
-    // The raw battery value is half the percentage.
-    if buf[0] == REPORT_ID && buf[1] == CMD_BATTERY {
-        Report::Battery(buf[5].saturating_mul(2).min(100))
-    } else if buf[0] == CMD_BATTERY {
-        Report::Battery(buf[4].saturating_mul(2).min(100))
-    } else {
-        Report::Unknown
+    match payload_of(buf) {
+        Some(p) if p[0] == CMD_BATTERY_LEVEL && p[1] == 0 => Report::Battery {
+            percent: p[5].min(100),
+            charging: p[6] != 0,
+        },
+        Some(_) => Report::Unknown,
+        None => Report::Ignored,
     }
 }
 
@@ -320,34 +347,64 @@ fn legacy_sensor_register(record: &[u8]) -> Option<String> {
     })
 }
 
-/// Decode EEPROM data starting at `addr` field by field.
-fn describe_eeprom(addr: u16, data: &[u8]) -> String {
+fn record_ok(r: &[u8]) -> bool {
+    r[3] == VALUE_KEY.wrapping_sub(r[0].wrapping_add(r[1]).wrapping_add(r[2]))
+}
+
+/// Decode EEPROM data starting at `addr`, one entry per field.
+///
+/// Known fields are named; unknown ones are shown as value/complement pairs or 4-byte
+/// records when their checks match, otherwise as raw bytes.
+pub fn eeprom_fields(addr: u16, data: &[u8]) -> Vec<String> {
     let mut fields = Vec::new();
+    let mut raw: Option<(u16, Vec<u8>)> = None;
     let mut a = addr;
     let mut rest = data;
     while !rest.is_empty() {
         let record = rest.get(..4);
-        let (text, used) = match (a, record) {
+        let entry = match (a, record) {
             (0x0c..=0x2b, Some(r)) if (a - 0x0c).is_multiple_of(4) => {
-                let ok = r[3] == VALUE_KEY.wrapping_sub(r[0].wrapping_add(r[1]).wrapping_add(r[2]));
+                let dpi = match (r[2], paw3395_dpi(r[0])) {
+                    (0, Some(dpi)) if r[0] == r[1] => format!("{} DPI (PAW3395SE) ", dpi),
+                    _ => String::new(),
+                };
                 let text = format!(
-                    "DPI stage {}: x=0x{:02X} y=0x{:02X} ex=0x{:02X}{}",
+                    "DPI stage {}: {}x=0x{:02X} y=0x{:02X} ex=0x{:02X}{}",
                     (a - 0x0c) / 4 + 1,
+                    dpi,
                     r[0],
                     r[1],
                     r[2],
-                    if ok { "" } else { " [record checksum mismatch]" }
+                    if record_ok(r) {
+                        ""
+                    } else {
+                        " [record checksum mismatch]"
+                    }
                 );
-                (text, 4)
+                Some((text, 4))
+            }
+            (0x2c..=0x4b, Some(r)) if (a - 0x2c).is_multiple_of(4) => {
+                let text = format!(
+                    "DPI stage {} colour #{:02X}{:02X}{:02X}{}",
+                    (a - 0x2c) / 4 + 1,
+                    r[0],
+                    r[1],
+                    r[2],
+                    if record_ok(r) {
+                        ""
+                    } else {
+                        " [record checksum mismatch]"
+                    }
+                );
+                Some((text, 4))
             }
             (0x60..=0x9f, Some(r)) if (a - 0x60).is_multiple_of(4) => {
                 let slot = ((a - 0x60) / 4) as usize;
                 let name = BUTTON_NAMES
                     .get(slot)
                     .map_or(format!("key slot {}", slot), |n| format!("button {}", n));
-                let ok = r[3] == VALUE_KEY.wrapping_sub(r[0].wrapping_add(r[1]).wrapping_add(r[2]));
                 let mut text = format!("{}: {} v1=0x{:02X} v2=0x{:02X}", name, button_class(r[0]), r[1], r[2]);
-                if !ok {
+                if !record_ok(r) {
                     text.push_str(" [record checksum mismatch");
                     if a == 0x70 {
                         if let Some(legacy) = legacy_sensor_register(r) {
@@ -356,28 +413,48 @@ fn describe_eeprom(addr: u16, data: &[u8]) -> String {
                     }
                     text.push(']');
                 }
-                (text, 4)
+                Some((text, 4))
             }
-            _ => match (pair_field(a, rest[0]), rest.get(1)) {
-                (Some(field), Some(&check)) => {
-                    let ok = if check == complement(rest[0]) {
-                        ""
-                    } else {
-                        " [bad complement]"
-                    };
-                    (format!("{}{}", field, ok), 2)
+            _ => {
+                let pair_ok = rest.get(1) == Some(&complement(rest[0]));
+                match (pair_field(a, rest[0]), rest.get(1)) {
+                    (Some(field), Some(_)) => Some((
+                        format!("{}{}", field, if pair_ok { "" } else { " [bad complement]" }),
+                        2,
+                    )),
+                    _ if pair_ok => Some((format!("0x{:04X} = 0x{:02X}", a, rest[0]), 2)),
+                    _ => match record {
+                        Some(r) if record_ok(r) => Some((format!("0x{:04X}: record [{}]", a, to_hex(r)), 4)),
+                        _ => None,
+                    },
                 }
-                _ => {
-                    fields.push(format!("0x{:04X}: [{}]", a, to_hex(rest)));
-                    break;
-                }
-            },
+            }
         };
-        fields.push(text);
+
+        let used = match entry {
+            Some((text, used)) => {
+                if let Some((start, bytes)) = raw.take() {
+                    fields.push(format!("0x{:04X}: [{}]", start, to_hex(&bytes)));
+                }
+                fields.push(text);
+                used
+            }
+            None => {
+                raw.get_or_insert((a, Vec::new())).1.push(rest[0]);
+                1
+            }
+        };
         a = a.wrapping_add(used as u16);
         rest = &rest[used.min(rest.len())..];
     }
-    fields.join("; ")
+    if let Some((start, bytes)) = raw {
+        fields.push(format!("0x{:04X}: [{}]", start, to_hex(&bytes)));
+    }
+    fields
+}
+
+fn describe_eeprom(addr: u16, data: &[u8]) -> String {
+    eeprom_fields(addr, data).join("; ")
 }
 
 /// Human-readable description of a vendor packet, for the sniffer, the probe and the capture decoder.
@@ -454,8 +531,8 @@ mod tests {
     fn battery_request_bytes() {
         let mut expected = [0u8; 17];
         expected[0] = 0x08;
-        expected[1] = 0x17;
-        expected[16] = 0x36;
+        expected[1] = 0x04;
+        expected[16] = 0x49;
         assert_eq!(battery_request(), expected);
     }
 
@@ -554,7 +631,7 @@ mod tests {
 
     #[test]
     fn build_packet_pads_and_checksums() {
-        assert_eq!(build_packet(&[0x17]), Some(battery_request()));
+        assert_eq!(build_packet(&[0x04]), Some(battery_request()));
         assert_eq!(build_packet(&[0; 16]), None);
     }
 
@@ -568,9 +645,14 @@ mod tests {
 
     #[test]
     fn describe_dpi_write_as_two_stages() {
+        // The legacy dpi/50 encoding is wrong for the PAW3395SE: asking 1600 DPI writes code
+        // 0x20, which the sensor reads as 1400 DPI, and stage 1 is forced to 200 DPI.
         let dpi = describe(&encode_setting(&Setting::Dpi(1600)));
         assert!(
-            dpi.ends_with("DPI stage 1: x=0x04 y=0x04 ex=0x00; DPI stage 2: x=0x20 y=0x20 ex=0x00"),
+            dpi.ends_with(
+                "DPI stage 1: 200 DPI (PAW3395SE) x=0x04 y=0x04 ex=0x00; \
+                 DPI stage 2: 1400 DPI (PAW3395SE) x=0x20 y=0x20 ex=0x00"
+            ),
             "{dpi}"
         );
     }
@@ -597,7 +679,8 @@ mod tests {
 
     #[test]
     fn describe_queries_and_responses() {
-        assert_eq!(describe(&battery_request()), "GetFarDistanceMode query");
+        assert_eq!(describe(&battery_request()), "GetBatteryLevel query");
+        assert_eq!(describe(&build_packet(&[0x17]).unwrap()), "GetFarDistanceMode query");
         assert_eq!(describe(&eeprom_read(0x60, 8)), "GetEEPROM 0x0060 len=8");
 
         let battery = build_packet(&[0x04, 0x00, 0x00, 0x00, 0x02, 0x5f, 0x00, 0x10, 0x00]).unwrap();
@@ -626,18 +709,97 @@ mod tests {
         assert_eq!(describe(&[0x08, 0x07]), "short report (2 bytes)");
     }
 
-    #[test]
-    fn parse_battery_reports() {
-        let mut with_id = [0u8; 16];
-        with_id[0] = 0x08;
-        with_id[1] = 0x17;
-        with_id[5] = 43;
-        assert_eq!(parse_report(&with_id), Report::Battery(86));
+    /// Replies captured from a VXE R1 SE+ (dongle 373b:1085, firmware 3.15, CID/MID 2,31).
+    const REAL_BATTERY_REPLY: [u8; 17] = [
+        0x08, 0x04, 0x00, 0x00, 0x00, 0x02, 0x64, 0x00, 0x10, 0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5a,
+    ];
+    const REAL_FAR_DISTANCE_REPLY: [u8; 17] = [
+        0x08, 0x17, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2c,
+    ];
+    const REAL_EEPROM_0000: [u8; 17] = [
+        0x08, 0x08, 0x00, 0x00, 0x00, 0x0a, 0x01, 0x54, 0x04, 0x51, 0x01, 0x54, 0x00, 0x55, 0x00, 0x55, 0x92,
+    ];
+    /// EEPROM 0x000C-0x002B: the four default stages 400/800/1600/3200 DPI, then copies of 3200.
+    const REAL_DPI_STAGES: [u8; 32] = [
+        0x09, 0x09, 0x00, 0x43, 0x12, 0x12, 0x00, 0x31, 0x25, 0x25, 0x00, 0x0b, 0x4b, 0x4b, 0x00, 0xbf, 0x4b, 0x4b,
+        0x00, 0xbf, 0x4b, 0x4b, 0x00, 0xbf, 0x4b, 0x4b, 0x00, 0xbf, 0x4b, 0x4b, 0x00, 0xbf,
+    ];
 
-        let mut without_id = [0u8; 16];
-        without_id[0] = 0x17;
-        without_id[4] = 200;
-        assert_eq!(parse_report(&without_id), Report::Battery(100));
+    #[test]
+    fn parse_real_battery_reply() {
+        assert_eq!(
+            parse_report(&REAL_BATTERY_REPLY),
+            Report::Battery {
+                percent: 100,
+                charging: false
+            }
+        );
+        assert_eq!(
+            describe(&REAL_BATTERY_REPLY),
+            "GetBatteryLevel: 100%, not charging, 4217 mV"
+        );
+        // The old 0x17 query is GetFarDistanceMode: its reply must not be read as battery.
+        assert_eq!(parse_report(&REAL_FAR_DISTANCE_REPLY), Report::Unknown);
+        assert_eq!(battery_request()[1], CMD_BATTERY_LEVEL);
+    }
+
+    #[test]
+    fn decode_real_eeprom() {
+        assert!(!describe(&REAL_EEPROM_0000).contains("bad checksum"));
+        assert_eq!(
+            describe(&REAL_EEPROM_0000),
+            "GetEEPROM 0x0000 len=10 data=[01 54 04 51 01 54 00 55 00 55] -> \
+             report rate 1000 Hz; DPI stage count 4; active DPI stage 1; 0x0006 = 0x00; 0x0008 = 0x00"
+        );
+        let stages = eeprom_fields(0x0c, &REAL_DPI_STAGES);
+        assert_eq!(stages.len(), 8);
+        assert_eq!(stages[0], "DPI stage 1: 400 DPI (PAW3395SE) x=0x09 y=0x09 ex=0x00");
+        assert!(stages[1].starts_with("DPI stage 2: 800 DPI"));
+        assert!(stages[2].starts_with("DPI stage 3: 1600 DPI"));
+        assert!(stages[3].starts_with("DPI stage 4: 3200 DPI"));
+    }
+
+    #[test]
+    fn paw3395_codes() {
+        for (dpi, code) in [
+            (50, 1),
+            (300, 6),
+            (350, 8),
+            (400, 0x09),
+            (800, 0x12),
+            (1600, 0x25),
+            (3200, 0x4b),
+        ] {
+            assert_eq!(paw3395_code(dpi), Some(code), "{dpi}");
+            assert_eq!(paw3395_dpi(code), Some(dpi), "{code}");
+        }
+        assert_eq!(paw3395_code(10_000), Some(235));
+        assert_eq!(paw3395_code(10_050), None);
+        assert_eq!(paw3395_code(825), None);
+        assert_eq!(paw3395_dpi(7), None);
+        for code in 1..=235 {
+            if let Some(dpi) = paw3395_dpi(code) {
+                assert_eq!(paw3395_code(dpi), Some(code));
+            }
+        }
+    }
+
+    #[test]
+    fn eeprom_fields_group_unknown_bytes() {
+        // Colour record, generic record, then bytes that are neither pairs nor records.
+        let fields = eeprom_fields(
+            0x48,
+            &[0xff, 0x00, 0xff, 0x57, 0x02, 0x53, 0xff, 0x00, 0xff, 0x57, 0x01, 0xff],
+        );
+        assert_eq!(
+            fields,
+            [
+                "DPI stage 8 colour #FF00FF",
+                "0x004C = 0x02",
+                "0x004E: record [FF 00 FF 57]",
+                "0x0052: [01 FF]"
+            ]
+        );
     }
 
     #[test]
@@ -645,7 +807,7 @@ mod tests {
         assert_eq!(parse_report(&[]), Report::Ignored);
         assert_eq!(parse_report(&[0x01; 16]), Report::Ignored);
         assert_eq!(parse_report(&[0x02; 16]), Report::Ignored);
-        assert_eq!(parse_report(&[0x17, 0, 0, 0, 50]), Report::Ignored);
+        assert_eq!(parse_report(&[0x04, 0, 0, 0, 50]), Report::Ignored);
         assert_eq!(parse_report(&[0x09; 16]), Report::Unknown);
     }
 }

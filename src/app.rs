@@ -15,7 +15,8 @@ const SNIFF_ENV: &str = "OPENVXE_SNIFF";
 
 pub struct App {
     pub devices: Vec<HidDevice>,
-    pub battery: u8,
+    /// Battery percentage and charging state, `None` until the first reply.
+    pub battery: Option<(u8, bool)>,
     last_battery_req: Option<Instant>,
     pub state: ListState,
     pub items: Vec<Setting>,
@@ -28,7 +29,7 @@ impl App {
     pub fn new(devices: Vec<HidDevice>) -> Self {
         let mut app = App {
             devices,
-            battery: 0,
+            battery: None,
             last_battery_req: None,
             state: ListState::default(),
             items: vec![
@@ -115,7 +116,7 @@ impl App {
             }
             match protocol::parse_report(&report) {
                 Report::Ignored => {}
-                Report::Battery(b) => new_battery = Some(b),
+                Report::Battery { percent, charging } => new_battery = Some((percent, charging)),
                 // Log only unknown packets, so battery responses don't spam the log.
                 Report::Unknown => {
                     let hex = report[..report.len().min(8)]
@@ -128,10 +129,11 @@ impl App {
             }
         }
 
-        if let Some(b) = new_battery {
-            if self.battery != b {
-                self.battery = b;
-                messages.push(format!("System: Battery updated to {}%", b));
+        if let Some((percent, charging)) = new_battery {
+            if self.battery != Some((percent, charging)) {
+                self.battery = Some((percent, charging));
+                let state = if charging { " (charging)" } else { "" };
+                messages.push(format!("System: Battery updated to {}%{}", percent, state));
             }
         }
         for msg in messages {

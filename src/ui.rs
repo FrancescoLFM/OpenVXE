@@ -80,16 +80,24 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(dpi_gauge, status_chunks[0]);
 
     // Battery gauge
-    let bat_color = match app.battery {
-        0..=20 => Color::Red,
-        21..=50 => Color::Yellow,
-        _ => Color::Green,
+    let (bat_percent, bat_color, bat_label) = match app.battery {
+        None => (0, Color::DarkGray, "Waiting...".to_string()),
+        Some((percent, charging)) => {
+            let color = match percent {
+                _ if charging => Color::Cyan,
+                0..=20 => Color::Red,
+                21..=50 => Color::Yellow,
+                _ => Color::Green,
+            };
+            let label = format!("{}%{}", percent, if charging { " (charging)" } else { "" });
+            (percent, color, label)
+        }
     };
     let bat_gauge = Gauge::default()
         .block(panel(" Battery Level "))
         .gauge_style(Style::default().fg(bat_color).bg(Color::DarkGray))
-        .percent(app.battery.into())
-        .label(format!("{}%", app.battery));
+        .percent(bat_percent.into())
+        .label(bat_label);
     f.render_widget(bat_gauge, status_chunks[1]);
 
     // Event log

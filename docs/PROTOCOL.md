@@ -10,6 +10,8 @@ Confidence levels:
 - ✅ **hw**: verified on real hardware by a public project (source given)
 - 🟡 **consistent**: inferred, and consistent with the packets OpenVXE already sends
 - ❓ **unverified**: single source or guess — needs a capture / `vxe-probe` check
+- 🟢 **OpenVXE hw**: verified by OpenVXE on a VXE R1 SE+ (dongle `373b:1085`, firmware
+  3.15, CID/MID 2,31) with `vxe-probe --info` / `--dump` (2026-10-15)
 
 ## Device identification
 
@@ -21,7 +23,12 @@ Confidence levels:
 | `373b:12dc`, `373b:1319` | R1 SE+ CORE26K (NearLink) | ❓ (OpenMouse, from HUB) |
 
 Since `1085` is a generic receiver, the actual mouse model must be identified at runtime with
-`GetMouseCIDMID` (R1 SE+ reported as CID/MID 2,32; HUB also lists 2,31 and 2,116 — ❓).
+`GetMouseCIDMID`. Our R1 SE+ reports **CID/MID 2,31** (PAW3395SE) 🟢; other sources report
+2,32 and 2,116.
+
+On `373b:1085` hidapi lists one entry per top-level collection of the same hidraw node
+(interface 1: usage pages `0x0001`, `0xFF03`, `0x000C`, `0xFF02`, `0xFF04`), plus the keyboard
+interface 0. OpenVXE opens each path once, only if it exposes a vendor usage page. 🟢
 Run `vxe-probe --list` to see the interfaces and usage pages of your device.
 
 ## Frame
@@ -48,7 +55,7 @@ Confidence: ✅ vendor; checksum verified against a published raw frame (unit te
 | `0x01` | DownLoadData | |
 | `0x02` | DownLoadDriverStatus | |
 | `0x03` | GetWirelessMouseOnline | |
-| `0x04` | **GetBatteryLevel** | see below |
+| `0x04` | **GetBatteryLevel** | see below 🟢 |
 | `0x05` / `0x06` | SetWirelessDonglePair / GetWirelessDonglePairResult | |
 | `0x07` | **SetEEPROM** | write configuration memory |
 | `0x08` | **GetEEPROM** | read configuration memory (some firmware replies with `0x07`) |
@@ -56,25 +63,26 @@ Confidence: ✅ vendor; checksum verified against a published raw frame (unit te
 | `0x0a` | ReportMouseStatus | |
 | `0x0d` | EnterUSBUpgradeMode | ⚠️ puts the mouse in bootloader mode |
 | `0x0e` / `0x0f` | GetCurrentConfig / SetCurrentConfig | profile bank 0–3 |
-| `0x10` | **GetMouseCIDMID** | CID at data `[0]`, MID at data `[1]` |
-| `0x12` | **GetMouseVersion** | BCD, e.g. `03 15` = 3.15 |
+| `0x10` | **GetMouseCIDMID** | CID at data `[0]`, MID at data `[1]` 🟢 |
+| `0x12` | **GetMouseVersion** | BCD, e.g. `03 15` = 3.15 🟢 |
 | `0x13` | DongleExitPair | |
 | `0x14` / `0x15` | Set / Get4KRGBMode | |
-| `0x16` / `0x17` | Set / **GetFarDistanceMode** | long range mode flag |
+| `0x16` / `0x17` | Set / **GetFarDistanceMode** | long range mode flag; our mouse replies len 10, all zero 🟢 |
 | `0x18` / `0x19` | Set / GetDongleLightMode | |
 | `0x1d` | GetDongleVersion | |
 
 Confidence: ✅ vendor (enum read in the HUB bundle).
 
-> ⚠️ **OpenVXE currently uses `0x17` as battery query.** According to the vendor code
-> `0x17` is GetFarDistanceMode, and the battery is `0x04`. To verify with `vxe-probe --info`.
+> OpenVXE used `0x17` as battery query until this was verified: its reply (length 10,
+> all zero) was read as `10 * 2 = 20 %`. The TUI now uses `0x04`. 🟢
 
 ### Battery (`0x04`)
 
 Request `04 00 … 00`. Reply data (payload offsets): `[5]` percent 0–100 (no ×2),
 `[6]` charging (0 = no, 1 = yes), `[7..8]` voltage in mV, big-endian.
 Example reply payload `04 00 00 00 02 5F 00 10 00 …` = 95 %, not charging, 4096 mV.
-Confidence: ✅ hw on `373b:1085` (vxe-battery-tray), ❓ charging flag mapping.
+Confidence: 🟢 (reply `04 00 00 00 02 64 00 10 79` = 100 %, not charging, 4217 mV),
+❓ charging flag value while charging.
 
 ## EEPROM map
 
@@ -83,19 +91,21 @@ records of 4 bytes end with `0x55 - (b0 + b1 + b2)`.
 
 | Address | Field | Encoding | Confidence |
 | --- | --- | --- | --- |
-| `0x00` | report rate | pair: 1 = 1000, 2 = 500, 4 = 250, 8 = 125 Hz | ✅ vendor |
-| `0x02` | DPI stage count | pair | ✅ vendor |
-| `0x04` | active DPI stage (0-based) | pair | ✅ vendor |
-| `0x0a` | lift-off distance | pair: 1 = 1 mm, 2 = 2 mm | ✅ vendor |
-| `0x0c`–`0x2b` | DPI stages 1–8 | records `[x, y, ex, check]` | ✅ vendor, 🟡 consistent |
-| `0x2c`–`0x4b` | DPI stage colours | | ❓ |
-| `0x4c` | DPI LED settings | | ❓ |
-| `0x60`–`0x9f` | button / key slots | records `[class, v1, v2, check]`; `0x60` left, `0x64` right, `0x68` middle, `0x6c` back, `0x70` forward, `0x74` bottom | ✅ vendor |
-| `0xa9` | debounce (ms) | pair | ✅ vendor, 🟡 consistent |
-| `0xab` | motion sync | pair | ✅ vendor, 🟡 consistent |
-| `0xad` | sleep time | pair, **units of 10 s** | ✅ vendor (`raw * 10`) |
+| `0x00` | report rate | pair: 1 = 1000, 2 = 500, 4 = 250, 8 = 125 Hz | ✅ vendor, 🟢 (1000 Hz read) |
+| `0x02` | DPI stage count | pair | ✅ vendor, 🟢 (4 read) |
+| `0x04` | active DPI stage (0-based) | pair | ✅ vendor, 🟢 |
+| `0x06`, `0x08` | unknown | pairs, both 0 | 🟢 read, meaning ❓ |
+| `0x0a` | lift-off distance | pair: 1 = 1 mm, 2 = 2 mm | ✅ vendor, 🟢 (1 read) |
+| `0x0c`–`0x2b` | DPI stages 1–8 | records `[x, y, ex, check]` | ✅ vendor, 🟢 (400/800/1600/3200 defaults) |
+| `0x2c`–`0x4b` | DPI stage colours | records `[r, g, b, check]` | 🟢 (red, green, blue, magenta...) |
+| `0x4c`–`0x5f` | LED settings | pairs `02, 80, 03, 00`, colour record `FF 00 FF`, pairs `00, 80, 03, 00` | 🟢 read, meaning ❓ (mode, brightness, speed?) |
+| `0x60`–`0x9f` | button / key slots | records `[class, v1, v2, check]`; `0x60` left, `0x64` right, `0x68` middle, `0x6c` back, `0x70` forward, `0x74` bottom | ✅ vendor, 🟢 (all records valid, forward = mouse `0x10`) |
+| `0xa9` | debounce (ms) | pair | ✅ vendor, 🟢 (8 read) |
+| `0xab` | motion sync | pair | ✅ vendor, 🟢 (on) |
+| `0xad` | sleep time | pair, **units of 10 s** | ✅ vendor (`raw * 10`), 🟢 (6 = 60 s read) |
 | `0xaf` | straight-line correction (angle snapping?) | pair | ❓ |
 | `0xb1` | ripple control | pair | ❓ |
+| `0xb3`–`0xbe` | unknown | pairs `00, 00, 06, 00, 0A, 00` | 🟢 read, meaning ❓ (sensor sleep / performance?) |
 | `0x100`– | shortcuts, 32-byte slots | | ❓ |
 | `0x300`– | macros, 384-byte slots | | ❓ |
 
@@ -108,14 +118,19 @@ Button classes: 0 disabled, 1 mouse (v1: 1 L, 2 R, 4 M, 8 back, 0x10 forward), 2
 Each stage is `[x, y, ex, 0x55 - (x + y + ex)]`. `ex` holds extra bits: low nibble for X,
 high nibble for Y. The meaning of `x`/`y` **depends on the sensor**:
 
-- **PAW3395SE** variant: `x`/`y` are an index into a code table (not `dpi / 50`), e.g.
-  800 → `0x12`, 1600 → `0x25`, 3200 → `0x4b`; above 10,000 DPI half the value is written
-  and an `ex` flag is set. ❓ (OpenMouse, hw on the wired `f58f`).
+- **PAW3395SE** variant (our mouse, CID/MID 2,31): `x`/`y` are an index into a code table
+  (not `dpi / 50`): 50–10,000 DPI in 50 DPI steps map to codes 1–235, skipping codes 7, 13,
+  20, 26, 33, 40, 46, 53, 60, 66, 73, 80, 86, 93, 100, 106, 113, 120, 126, 133, 140, 146,
+  153, 160, 166, 173, 180, 186, 193, 200, 206, 213, 220, 226, 233. 🟢 for 400 → `0x09`,
+  800 → `0x12`, 1600 → `0x25`, 3200 → `0x4b` (default stages). Above 10,000 DPI half the
+  value is written and an `ex` flag is set ❓ (OpenMouse).
 - **CORE26K** variant (up to 26,000 DPI): count = `dpi / 50 - 1`, low byte in `x`/`y`,
   bits 8–9 in `ex` bits 2–3 (Y: 6–7), i.e. `ex = high * 0x44` for X = Y. ❓ (OpenMouse,
   Linux-ATK).
 
-OpenVXE currently writes `dpi / 50` with `ex = 0`, which matches neither exactly. The
+OpenVXE currently writes `dpi / 50` with `ex = 0`, which matches neither: on our
+PAW3395SE, asking 1600 DPI writes code `0x20` = **1400 DPI**, and stage 1 is forced to code
+`0x04` = **200 DPI**. The
 right encoding must be chosen from `GetMouseCIDMID` and confirmed with a capture.
 
 ## How OpenVXE's current packets map onto this

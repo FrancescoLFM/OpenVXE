@@ -148,20 +148,44 @@ fn info(devices: &[hidapi::HidDevice]) {
         protocol::CMD_BATTERY_LEVEL,
         protocol::CMD_GET_CID_MID,
         protocol::CMD_GET_VERSION,
-        0x17, // GetFarDistanceMode, used as battery query by the TUI
+        0x17, // GetFarDistanceMode (used as battery query by OpenVXE before 0.2)
     ] {
         let packet = protocol::build_packet(&[cmd]).expect("one byte payload");
         print_reply(&format!("[0x{:02X}]", cmd), request(devices, &packet));
     }
 }
 
+/// Read the EEPROM range in chunks, print a hex dump and decode each contiguous run of
+/// successfully read bytes as a whole, so records are not split at chunk boundaries.
 fn dump(devices: &[hidapi::HidDevice], from: u16, to: u16) {
+    let mut segments: Vec<(u16, Vec<u8>)> = Vec::new();
     let mut addr = from;
     while addr < to {
         let len = (to - addr).min(protocol::EEPROM_CHUNK as u16) as u8;
-        let reply = request(devices, &protocol::eeprom_read(addr, len));
-        print_reply(&format!("[0x{:04X}]", addr), reply);
+        match request(devices, &protocol::eeprom_read(addr, len)) {
+            Some(report) if payload(&report).get(1) == Some(&0) => {
+                let data = &payload(&report)[5..5 + len as usize];
+                match segments.last_mut() {
+                    Some((start, bytes)) if *start as usize + bytes.len() == addr as usize => {
+                        bytes.extend_from_slice(data)
+                    }
+                    _ => segments.push((addr, data.to_vec())),
+                }
+            }
+            reply => print_reply(&format!("[0x{:04X}]", addr), reply),
+        }
         addr += len as u16;
+    }
+
+    for (start, bytes) in &segments {
+        println!("Hex dump:");
+        for (i, line) in bytes.chunks(16).enumerate() {
+            println!("  0x{:04X}  {}", *start as usize + i * 16, protocol::to_hex(line));
+        }
+        println!("Decoded:");
+        for field in protocol::eeprom_fields(*start, bytes) {
+            println!("  {}", field);
+        }
     }
 }
 
