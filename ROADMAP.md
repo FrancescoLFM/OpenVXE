@@ -9,24 +9,28 @@ Legenda priorità: 🔴 alta · 🟠 media · 🟢 bassa
 
 ## 1. Bug
 
-### 🔴 1.1 DPI oltre 12.750 non funziona (overflow `u8`)
+### ✅ 1.1 DPI oltre 12.750 non funziona (overflow `u8`) (risolto per PAW3395SE)
 `src/main.rs:82` — `let val = (dpi / 50) as u8;`
 
 Con DPI max 26.000 il valore è `520`, che troncato a `u8` diventa `8` → il mouse riceve **400 DPI** invece di 26.000. Tutto ciò che supera `255 × 50 = 12.750` viene inviato errato, quindi il range dichiarato nel README (50–26.000) è falso.
 Il protocollo quasi certamente prevede un byte alto (probabilmente `p[11]` o bit extra in un byte vicino) che va scoperto sniffando il software ufficiale a DPI > 12.750.
 Nel frattempo: limitare il clamp a 12.750 in `modify_setting` (`src/main.rs:258`).
 
+> **Fase 4**: la TUI usa la tabella dei codici PAW3395SE (50–10.000 DPI, passo 50) e abilita la modifica dei DPI solo se `GetMouseCIDMID` risponde 2,31. Restano da fare la codifica CORE26K e i DPI oltre 10.000 (byte `ex`).
+
 > **Verificato sull'hardware** (CID/MID 2,31 = PAW3395SE): chiedendo 1600 DPI la TUI scrive il codice `0x20`, cioè **1400 DPI**, e forza lo stadio 1 a **200 DPI**. La tabella dei codici è in `protocol::paw3395_code`.
 >
 > **Aggiornamento fase 3** (vedi `docs/PROTOCOL.md`): i byte X/Y non sono `dpi / 50` in generale, la codifica dipende dal sensore (PAW3395SE usa una tabella di codici, CORE26K usa `dpi / 50 - 1` con i bit alti nel terzo byte dello stadio). Il pacchetto DPI scrive inoltre **due stadi** (stadio 1 fisso a codice 4). Serve `GetMouseCIDMID` (`vxe-probe --info`) per scegliere la codifica.
 
-### 🔴 1.2 La UI mostra valori finti, non quelli del mouse
+### ✅ 1.2 La UI mostra valori finti, non quelli del mouse (risolto)
 `src/main.rs:154-161` — i settaggi partono da default hardcoded (800 DPI, 1000 Hz, ...). Non viene mai letta la configurazione reale.
 Conseguenze:
 - All'avvio la UI può mostrare valori diversi da quelli attivi.
 - La prima pressione di ←/→ invia `default ± step`, non `valore_reale ± step` (es. mouse a 1600 DPI → premo → → il mouse va a 850 DPI).
 
 Serve un comando di lettura config (vedi 2.1).
+
+> **Fase 4**: all'avvio la TUI legge l'EEPROM `0x00–0xBF` con `GetEEPROM` e mostra solo i valori reali.
 
 ### 🔴 1.3 Panic lascia il terminale rotto
 `src/main.rs:137` (`HidApi::new().unwrap()`) e `src/main.rs:143` (`set_blocking_mode(false).unwrap()`) vengono eseguiti **dopo** `enable_raw_mode()` + `EnterAlternateScreen`. Un panic lascia il terminale in raw mode e nell'alternate screen (serve `reset`).
@@ -44,11 +48,13 @@ Problemi:
 
 Fix: filtrare per `usage_page`/`interface_number` del canale vendor, usare un solo metodo di invio, propagare l'errore e mostrarlo nel log.
 
-### 🟠 1.6 Motion Sync sovrascrive il timer di sleep
+### ✅ 1.6 Motion Sync sovrascrive il timer di sleep (risolto)
 `src/main.rs:112` — il pacchetto Motion Sync contiene anche il tempo di sleep, forzato a `0x05`. Chi aveva impostato un altro sleep dal software ufficiale lo perde silenziosamente.
 Fix: rendere lo sleep un settaggio vero (vedi 2.4) e inviare entrambi i valori correnti.
 
 > **Aggiornamento fase 3**: il pacchetto scrive 10 byte da `0xA9`. Oltre a motion sync imposta **debounce a 8 ms** e **sleep a 50 s** (unità da 10 s, non minuti), poi due coppie con complemento non valido su straight-line correction e ripple control. Va riscritto per inviare solo `0xAB`.
+
+> **Fase 4**: la TUI riscrive il blocco `0xA9–0xB2` partendo dai valori letti dal mouse, cambiando solo il campo modificato. Se una coppia del blocco ha il complemento non valido, la scrittura viene rifiutata.
 
 ### ✅ 1.7 Batteria: 0% rosso prima della prima lettura (risolto: "Waiting...", stato di carica mostrato)
 `battery: 0` (`src/main.rs:151`) è indistinguibile da "batteria scarica". Usare `Option<u8>` e mostrare `--` / "In attesa…" finché non arriva la risposta. La formula `raw * 2` (`src/main.rs:202,204`) andrebbe verificata (step del 2%? scala 0–50?), e manca lo stato di carica.
@@ -71,7 +77,7 @@ I device vengono aperti una sola volta all'avvio. Se il mouse/dongle viene stacc
 
 ---
 
-### 🟠 1.12 Le scritture a `0x70` non vengono salvate (verificato: il tasto avanti non viene toccato)
+### ✅ 1.12 Le scritture a `0x70` non vengono salvate (risolto: la TUI usa gli indirizzi del vendor)
 **Test sull'hardware:** il pacchetto legacy (polling 500 Hz) viene confermato dal mouse, ma l'EEPROM non cambia: il tasto avanti resta intatto e il polling resta 1000 Hz. Quindi polling, LOD, debounce e angle snapping della TUI probabilmente non hanno alcun effetto. Una scrittura `SetEEPROM` corretta a `0x00` funziona invece ed è stata verificata. Testo originale:
 
 Polling rate, LOD, debounce e angle snapping vengono scritti come record di 4 byte all'indirizzo `0x70`. Nella mappa EEPROM del vendor `0x70` è il record del **tasto avanti**, e questi record non hanno un checksum valido. Nessuna fonte oltre OpenVXE conferma lo schema "registri sensore" a `0x70`. Da verificare con `vxe-probe --dump --from 60 --to 78` prima e dopo aver cambiato uno di quei settaggi. Se confermato, usare gli indirizzi del vendor: `0x00` polling, `0x0A` LOD, `0xA9` debounce.
@@ -83,10 +89,10 @@ La TUI interroga `0x17`, che per il vendor è `GetFarDistanceMode`. La batteria 
 
 ## 2. Feature mancanti
 
-### 🔴 2.1 Lettura della configurazione dal mouse
+### ✅ 2.1 Lettura della configurazione dal mouse (fatto)
 Il prerequisito per tutto il resto. Sniffare (Wireshark + usbmon, o USBPcap su Windows) cosa fa il software ufficiale all'avvio: quasi sicuramente esiste un comando "read" (probabilmente con lo stesso layout indirizzo/lunghezza dei comandi `0x07`, es. `0x08`) che restituisce la memoria config.
 
-### 🔴 2.2 Stadi DPI multipli
+### ✅ 2.2 Stadi DPI multipli (fatto, senza DPI X/Y separati)
 Il mouse ha più stadi DPI selezionabili col tasto sotto. Ora si modifica solo uno stadio (indirizzo `0x0c`). Servono: numero di stadi attivi, valore per stadio, stadio corrente, eventualmente DPI X/Y separati (i due byte `p[9]`/`p[10]` sono già X e Y identici).
 
 ### 🟠 2.3 Rimappatura tasti e macro
@@ -191,15 +197,21 @@ src/
 
 1. ✅ **Base solida** (completata): fix 1.3, 1.4, 1.10, clamp DPI a 12.750 (1.1 temporaneo), README + udev + LICENSE GPL-3.0 (3.3).
 2. ✅ **Refactor** (completata): moduli `protocol`/`device`/`app`/`ui`, 9 test del protocollo con byte di riferimento, CI GitHub Actions, clippy pulito con `-D warnings`, commenti in inglese, ratatui 0.30 + crossterm 0.29 (3.2, 3.4). Restano da 3.4: `anyhow`/`thiserror` (insieme alla gestione errori della fase 4); da 3.3: metadati `Cargo.toml` e rinomina del pacchetto in `openvxe`.
-3. 🟡 **Reverse engineering** (strumenti e documentazione pronti, manca la verifica sull'hardware):
+3. ✅ **Reverse engineering** (completata):
    - fatto: `docs/PROTOCOL.md` con fonti e livelli di confidenza, `docs/CAPTURE.md`, `vxe-decode`, `vxe-probe` (`--info`, `--dump` in sola lettura, allowlist dei comandi), sniffer su file (`OPENVXE_SNIFF`);
    - ✅ verificato col mouse (`--info`, `--dump`): batteria `0x04`, CID/MID 2,31 (PAW3395SE), firmware 3.15, mappa EEPROM (stadi DPI, colori, tasti, debounce/motion sync/sleep); tasto avanti integro;
    - ✅ risolti 1.7, 1.13 e in parte 1.5 (un'apertura per path, solo interfacce vendor), regola udev rinominata `70-` (con `99-` l'ACL non veniva applicata);
    - ✅ scritture testate: `SetEEPROM` a `0x00` (polling 1000→500→1000 Hz) funziona e viene confermata con un eco; il pacchetto legacy a `0x70` viene confermato ma ignorato (1.12); EEPROM finale identica al backup;
    - ✅ scoperto che con il mouse in sleep il dongle non risponde e le scritture vanno perse: la TUI deve gestire "nessuna risposta";
-   - poi: lettura config all'avvio (2.1), codifica DPI corretta (1.1), stadi DPI (2.2), fix 1.6, 1.12 e 1.13.
-4. **TUI sul protocollo reale** (prossima): leggere la config all'avvio (`GetEEPROM`), scrivere i singoli campi agli indirizzi del vendor (`0x00` polling, `0x0A` LOD, `0xA9` debounce, `0xAB` motion sync, `0xAD` sleep, `0x0C+` stadi DPI con codici PAW3395SE), confermare ogni scrittura con l'eco, gestire il mouse in sleep (1.1, 1.2, 1.6, 1.12, 2.1, 2.2).
-5. **Robustezza**: filtro interfacce e gestione errori (1.5), hotplug (1.8), batteria `Option` + carica (1.7).
+   - il seguito (lettura config, codifica DPI, stadi DPI, fix 1.6 e 1.12) è nella fase 4.
+4. ✅ **TUI sul protocollo reale** (completata):
+   - nuovo modulo `config`: immagine EEPROM `0x00–0xBF`, settaggi letti dalle coppie `(v, 0x55−v)`, scrittura del blocco minimo che contiene il campo (stadi DPI a coppie da 8 byte, blocco prestazioni `0xA9` da 10 byte);
+   - coda di richieste in `app`: identità e firmware, lettura della config all'avvio, batteria ogni 10 s, una richiesta alla volta con timeout 300 ms, conferma di ogni scrittura con l'eco, scritture sullo stesso blocco unite, rilettura del blocco se il mouse rifiuta;
+   - mouse in sleep: la TUI mostra "Waiting for the mouse", riprova ogni secondo e invia le modifiche al risveglio; uscire con modifiche in sospeso chiede conferma;
+   - settaggi: stadi DPI (codici PAW3395SE), numero di stadi, stadio attivo, polling 125–1000 Hz, LOD, debounce, motion sync, sleep, angle snapping, ripple control;
+   - ✅ testata sull'hardware: polling 1000→500→1000 Hz dalla TUI, entrambe le scritture confermate dall'eco, EEPROM finale identica al backup (192 byte);
+   - risolti 1.1 (per PAW3395SE), 1.2, 1.6, 1.12, 2.1, 2.2.
+5. **Robustezza** (prossima): gestione errori con `anyhow`/`thiserror` (1.5, 3.4), hotplug (1.8), mouse capture (1.9), metadati `Cargo.toml` (3.3).
 6. **Feature utente**: profili (2.5), CLI (2.6), UX (2.7).
 7. **Espansione**: rimappatura tasti/macro (2.3), altri modelli/chipset, multipiattaforma, pacchetti.
 

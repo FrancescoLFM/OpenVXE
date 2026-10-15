@@ -10,15 +10,17 @@ An open-source, lightweight, and blazing-fast TUI (Terminal User Interface) driv
 
 * **Native Linux Support:** Direct hardware communication via `hidapi` (no root required with udev rules).
 * **Terminal UI:** Beautiful, minimalist interface built with `ratatui`.
-* **Live Configuration:** Apply changes instantly without saving.
-  * Adjust DPI (50 - 12,750)
-    > ⚠️ Values above 12,750 DPI are not supported yet due to a known encoding limitation; full range (up to 26,000) is pending protocol reverse engineering.
-  * Polling Rate (250Hz / 500Hz / 1000Hz)
-  * Lift-off Distance (LOD)
+* **Reads the real configuration:** the current settings are loaded from the mouse's EEPROM at startup.
+* **Live Configuration:** every change is written to the mouse straight away and confirmed by its echo.
+  * DPI stages (50 - 10,000 in steps of 50, PAW3395SE sensor), number of stages and active stage
+  * Polling Rate (125Hz / 250Hz / 500Hz / 1000Hz)
+  * Lift-off Distance (1 mm / 2 mm)
   * Debounce Time (1ms - 20ms)
   * Motion Sync (On/Off)
-  * Angle Snapping (On/Off)
-* **Real-time Battery Monitor:** Accurate battery parsing straight from the mouse's internal sensors.
+  * Sleep timer (30 s - 30 min)
+  * Angle Snapping (On/Off) and Ripple Control (On/Off)
+* **Sleep aware:** while the mouse sleeps the dongle doesn't answer; changes are queued and sent when it wakes up.
+* **Real-time Battery Monitor:** battery level and charging state read with the vendor `GetBatteryLevel` command.
 * **Hex Sniffer:** Built-in packet monitor for debugging hardware responses.
 
 ## 🚀 Installation & Setup
@@ -69,9 +71,9 @@ cargo build --release
 | `←` / `→` or `h` / `l` | Change value |
 | `q` or `Esc` | Quit |
 
-Settings are applied **live** to the mouse as soon as you change them.
+Settings are read from the mouse at startup and applied **live** as soon as you change them. If the mouse is asleep, move it to wake it up: pending changes are sent then, and quitting with changes still pending asks you to press `q` again.
 
-> ℹ️ The UI does not yet read the current configuration from the mouse: it starts from default values, so the first change you make is applied relative to those defaults.
+> ℹ️ DPI editing is enabled only for the PAW3395SE sensor (CID/MID 2,31), the only DPI encoding verified so far. Other settings work on any sensor.
 
 ## 🛠️ Troubleshooting
 
@@ -82,6 +84,9 @@ Settings are applied **live** to the mouse as soon as you change them.
   lsusb | grep 373b
   ```
   If nothing shows up, try a different USB port or cable.
+
+**"Waiting for the mouse: move it to wake it up"**
+* The mouse is asleep and the dongle doesn't answer. Move it or click a button.
 
 ## 🤝 Contributing
 

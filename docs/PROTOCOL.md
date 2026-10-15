@@ -104,14 +104,21 @@ records of 4 bytes end with `0x55 - (b0 + b1 + b2)`.
 | `0x0a` | lift-off distance | pair: 1 = 1 mm, 2 = 2 mm | ✅ vendor, 🟢 (1 read) |
 | `0x0c`–`0x2b` | DPI stages 1–8 | records `[x, y, ex, check]` | ✅ vendor, 🟢 (400/800/1600/3200 defaults) |
 | `0x2c`–`0x4b` | DPI stage colours | records `[r, g, b, check]` | 🟢 (red, green, blue, magenta...) |
-| `0x4c`–`0x5f` | LED settings | pairs `02, 80, 03, 00`, colour record `FF 00 FF`, pairs `00, 80, 03, 00` | 🟢 read, meaning ❓ (mode, brightness, speed?) |
+| `0x4c`–`0x53` | DPI LED: effect, brightness, speed, enable | pairs (`02, 80, 03, 00` read) | ✅ vendor names, 🟢 read |
+| `0x54` | logo LED colour | record `[r, g, b, check]` (`FF 00 FF` read) | ✅ vendor, 🟢 |
+| `0x58`–`0x5f` | logo LED: effect, brightness, breathing speed, energy saving | pairs (`00, 80, 03, 00` read) | ✅ vendor names, 🟢 read |
 | `0x60`–`0x9f` | button / key slots | records `[class, v1, v2, check]`; `0x60` left, `0x64` right, `0x68` middle, `0x6c` back, `0x70` forward, `0x74` bottom | ✅ vendor, 🟢 (all records valid, forward = mouse `0x10`) |
+| `0xa0` | decoration light | | ✅ vendor name, meaning ❓ |
 | `0xa9` | debounce (ms) | pair | ✅ vendor, 🟢 (8 read) |
 | `0xab` | motion sync | pair | ✅ vendor, 🟢 (on) |
 | `0xad` | sleep time | pair, **units of 10 s** | ✅ vendor (`raw * 10`), 🟢 (6 = 60 s read) |
-| `0xaf` | straight-line correction (angle snapping?) | pair | ❓ |
-| `0xb1` | ripple control | pair | ❓ |
-| `0xb3`–`0xbe` | unknown | pairs `00, 00, 06, 00, 0A, 00` | 🟢 read, meaning ❓ (sensor sleep / performance?) |
+| `0xaf` | angle snapping (vendor: linear correction) | pair, 0/1 | ✅ vendor, 🟢 (0 read) |
+| `0xb1` | ripple control | pair, 0/1 | ✅ vendor, 🟢 (0 read) |
+| `0xb3` | move-close lights | pair | ✅ vendor name, 🟢 (0 read) |
+| `0xb5`, `0xb7`, `0xb9` | sensor enable, sensor time, sensor mode | pairs (`00, 06, 00` read) | ✅ vendor names, meaning ❓ |
+| `0xbb` | RF TX time | pair (`0A` read) | ✅ vendor name, meaning ❓ |
+| `0xbd` | angle | pair (`00` read) | ✅ vendor name, meaning ❓ |
+| `0xe3` | rolling (wheel) delay | | ✅ vendor name, not read yet |
 | `0x100`– | shortcuts, 32-byte slots | | ❓ |
 | `0x300`– | macros, 384-byte slots | | ❓ |
 
@@ -134,14 +141,34 @@ high nibble for Y. The meaning of `x`/`y` **depends on the sensor**:
   bits 8–9 in `ex` bits 2–3 (Y: 6–7), i.e. `ex = high * 0x44` for X = Y. ❓ (OpenMouse,
   Linux-ATK).
 
-OpenVXE currently writes `dpi / 50` with `ex = 0`, which matches neither: on our
-PAW3395SE, asking 1600 DPI writes code `0x20` = **1400 DPI**, and stage 1 is forced to code
-`0x04` = **200 DPI**. The
-right encoding must be chosen from `GetMouseCIDMID` and confirmed with a capture.
+The legacy OpenVXE packet wrote `dpi / 50` with `ex = 0`, which matches neither: on our
+PAW3395SE, asking 1600 DPI wrote code `0x20` = **1400 DPI**, and stage 1 was forced to code
+`0x04` = **200 DPI**. The TUI now uses the PAW3395SE table and enables DPI editing only when
+`GetMouseCIDMID` answers 2,31.
 
-## How OpenVXE's current packets map onto this
+## How the TUI reads and writes (phase 4)
 
-Re-reading the packets the TUI sends with the map above (`vxe-decode` does this
+1. At startup: `GetMouseCIDMID`, `GetMouseVersion`, then `GetEEPROM` over `0x00–0xBF` in
+   10-byte chunks. The settings shown are decoded from this image; nothing is hardcoded.
+2. One request is in flight at a time. A reply matches when it has the same command (or
+   `0x07` for `GetEEPROM`) and the same address. No reply within 300 ms twice in a row means
+   the mouse is asleep: the request goes back to the head of the queue and is retried every
+   second.
+3. A change rewrites the smallest block that contains the field, built from the current
+   image: a pair (`0x00`, `0x02`, `0x04`, `0x0a`), two DPI stages as one 8-byte block
+   (`0x0c`, `0x14`, `0x1c`, `0x24`), or the 10-byte performance block at `0xa9` (debounce,
+   motion sync, sleep, angle snapping, ripple). The performance block is not written if any
+   of its pairs has an invalid complement.
+4. A write is done when the mouse echoes it (~80 ms). Writes to the same block that are
+   still queued are merged. If the mouse rejects a write, the block is read back so the UI
+   matches the EEPROM again.
+
+🟢 Tested from the TUI: polling 1000 → 500 → 1000 Hz, both writes echoed, the final
+EEPROM identical to the backup (all 192 bytes).
+
+## How the legacy OpenVXE packets map onto this
+
+Re-reading the packets the TUI sent before phase 4 with the map above (`vxe-decode` does this
 automatically):
 
 - **DPI** `07 00 00 0c 08 | 04 04 00 4d | X Y 00 C` writes **two stages**: stage 1 fixed
