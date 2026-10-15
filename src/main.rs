@@ -1,5 +1,6 @@
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    cursor,
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -16,11 +17,14 @@ use std::{io, time::{Duration, Instant}};
 
 const VXE_VID: u16 = 0x373b; 
 const VXE_PID: u16 = 0x1085; 
+// DPI is encoded as a single byte in steps of 50 (255 * 50). Higher values need
+// the (still unknown) high byte of the protocol.
+const MAX_DPI: u16 = 12750;
 
 struct App {
     devices: Vec<HidDevice>,
     battery: u8,
-    last_battery_req: Instant,
+    last_battery_req: Option<Instant>,
     state: ListState,
     items: Vec<Setting>,
     logs: Vec<String>,
@@ -127,29 +131,53 @@ fn request_battery(devices: &[HidDevice]) {
     }
 }
 
-fn main() -> Result<(), io::Error> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, cursor::Show);
+}
 
-    let api = HidApi::new().unwrap();
+fn main() -> Result<(), io::Error> {
+    // Initialize HID before touching the terminal, so errors are printed normally.
+    let api = HidApi::new().map_err(io::Error::other)?;
     let mut open_devices = Vec::new();
 
     for device_info in api.device_list() {
         if device_info.vendor_id() == VXE_VID && device_info.product_id() == VXE_PID {
             if let Ok(dev) = device_info.open_device(&api) {
-                dev.set_blocking_mode(false).unwrap();
-                open_devices.push(dev);
+                // A blocking device would freeze the UI loop, so skip it.
+                if dev.set_blocking_mode(false).is_ok() {
+                    open_devices.push(dev);
+                }
             }
         }
     }
 
+    // Restore the terminal on panic, otherwise it stays in raw mode / alternate screen.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_hook(info);
+    }));
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    if let Err(err) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+        restore_terminal();
+        return Err(err);
+    }
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = match Terminal::new(backend) {
+        Ok(t) => t,
+        Err(err) => {
+            restore_terminal();
+            return Err(err);
+        }
+    };
+
     let mut app = App {
         devices: open_devices,
         battery: 0,
-        last_battery_req: Instant::now() - Duration::from_secs(60),
+        last_battery_req: None,
         state: ListState::default(),
         items: vec![
             Setting::DPI(800),
@@ -172,9 +200,7 @@ fn main() -> Result<(), io::Error> {
 
     let res = run_app(&mut terminal, &mut app);
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
-    terminal.show_cursor()?;
+    restore_terminal();
 
     if let Err(err) = res { println!("{:?}", err) }
     Ok(())
@@ -183,9 +209,9 @@ fn main() -> Result<(), io::Error> {
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
     loop {
         if !app.devices.is_empty() {
-            if app.last_battery_req.elapsed() >= Duration::from_secs(10) {
+            if app.last_battery_req.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
                 request_battery(&app.devices);
-                app.last_battery_req = Instant::now();
+                app.last_battery_req = Some(Instant::now());
             }
 
             let mut temp_logs = Vec::new();
@@ -225,6 +251,8 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
 
         if event::poll(Duration::from_millis(16))? { 
             if let Event::Key(key) = event::read()? {
+                // Ignore release/repeat events (sent on Windows and with the kitty protocol).
+                if key.kind != KeyEventKind::Press { continue; }
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Down | KeyCode::Char('j') => {
@@ -255,7 +283,7 @@ fn modify_setting(app: &mut App, dir: i32) {
         let new_setting = {
             let setting = &mut app.items[idx];
             match setting {
-                Setting::DPI(v) => *v = (*v as i32 + dir * 50).clamp(50, 26000) as u16,
+                Setting::DPI(v) => *v = (*v as i32 + dir * 50).clamp(50, MAX_DPI as i32) as u16,
                 Setting::PollingRate(v) => *v = if dir > 0 { if *v == 1000 { 1000 } else { *v * 2 } } else { if *v == 250 { 250 } else { *v / 2 } },
                 Setting::LOD(v) => *v = if dir > 0 { 2 } else { 1 },
                 Setting::Debounce(v) => *v = (*v as i32 + dir).clamp(1, 20) as u8,
@@ -320,7 +348,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
 
     // Виджет DPI
     let current_dpi = match app.items[0] { Setting::DPI(v) => v, _ => 800 };
-    let dpi_percent = (current_dpi as f64 / 26000.0 * 100.0) as u16;
+    let dpi_percent = (current_dpi as f64 / MAX_DPI as f64 * 100.0) as u16;
     let dpi_gauge = Gauge::default()
         .block(Block::default().title(" DPI Level ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)))
         .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
