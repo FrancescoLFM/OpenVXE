@@ -1,17 +1,9 @@
 //! VXE R1 SE+ HID protocol: packet encoding and report parsing.
 //!
-//! Pure functions with no HID dependency, so they can be unit tested.
-
-use std::fmt;
+//! Pure functions with no HID dependency, so they can be unit tested. See docs/PROTOCOL.md.
 
 pub const VXE_VID: u16 = 0x373b;
 pub const VXE_PID: u16 = 0x1085;
-
-/// DPI is encoded as a single byte in steps of 50 (255 * 50). Higher values need
-/// the (still unknown) high byte of the protocol.
-pub const MAX_DPI: u16 = 12750;
-pub const MIN_DPI: u16 = 50;
-pub const DPI_STEP: u16 = 50;
 
 pub const REPORT_ID: u8 = 0x08;
 pub const CMD_WRITE: u8 = 0x07;
@@ -24,48 +16,7 @@ const CHECKSUM_KEY: u8 = 0x4D;
 /// A complete output report: report ID followed by the 16-byte payload.
 pub type Packet = [u8; 17];
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Setting {
-    Dpi(u16),
-    PollingRate(u16),
-    Lod(u8),
-    Debounce(u8),
-    MotionSync(bool),
-    AngleSnap(bool),
-}
-
-impl fmt::Display for Setting {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Setting::Dpi(v) => write!(f, "DPI: {}", v),
-            Setting::PollingRate(v) => write!(f, "Polling Rate: {} Hz", v),
-            Setting::Lod(v) => write!(
-                f,
-                "Lift-off Distance: {}",
-                if *v == 1 { "Low (1mm)" } else { "High (2mm)" }
-            ),
-            Setting::Debounce(v) => write!(f, "Debounce Time: {} ms", v),
-            Setting::MotionSync(v) => write!(f, "Motion Sync: {}", if *v { "Enabled" } else { "Disabled" }),
-            Setting::AngleSnap(v) => write!(f, "Angle Snapping: {}", if *v { "Enabled" } else { "Disabled" }),
-        }
-    }
-}
-
-impl Setting {
-    /// Step the setting by one unit in direction `dir` (negative = decrease).
-    pub fn adjust(&mut self, dir: i32) {
-        match self {
-            Setting::Dpi(v) => *v = (*v as i32 + dir * DPI_STEP as i32).clamp(MIN_DPI as i32, MAX_DPI as i32) as u16,
-            Setting::PollingRate(v) => *v = if dir > 0 { (*v * 2).min(1000) } else { (*v / 2).max(250) },
-            Setting::Lod(v) => *v = if dir > 0 { 2 } else { 1 },
-            Setting::Debounce(v) => *v = (*v as i32 + dir).clamp(1, 20) as u8,
-            Setting::MotionSync(v) => *v = !*v,
-            Setting::AngleSnap(v) => *v = !*v,
-        }
-    }
-}
-
-fn complement(value: u8) -> u8 {
+pub fn complement(value: u8) -> u8 {
     VALUE_KEY.wrapping_sub(value)
 }
 
@@ -80,54 +31,6 @@ fn finish(mut payload: [u8; 16]) -> Packet {
     buf[0] = REPORT_ID;
     buf[1..17].copy_from_slice(&payload);
     buf
-}
-
-/// Write one value to a sub-register of the sensor settings block (address `0x70`).
-fn sensor_register(register: u8, value: u8) -> Packet {
-    let mut p = [
-        CMD_WRITE, 0x00, 0x00, 0x70, 0x04, register, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    ];
-    p[6] = value;
-    p[8] = complement(value);
-    finish(p)
-}
-
-pub fn encode_setting(setting: &Setting) -> Packet {
-    match setting {
-        Setting::Dpi(dpi) => {
-            let mut p = [
-                CMD_WRITE, 0x00, 0x00, 0x0c, 0x08, 0x04, 0x04, 0x00, 0x4d, 0, 0, 0, 0, 0, 0, 0,
-            ];
-            let val = (dpi.min(&MAX_DPI) / DPI_STEP) as u8;
-            // X and Y DPI; their complement is stored as a single combined byte.
-            p[9] = val;
-            p[10] = val;
-            p[12] = VALUE_KEY.wrapping_sub(val.wrapping_add(val));
-            finish(p)
-        }
-        Setting::PollingRate(hz) => {
-            let val = match hz {
-                1000 => 0x01,
-                500 => 0x02,
-                _ => 0x03,
-            };
-            sensor_register(0x0b, val)
-        }
-        Setting::Lod(lvl) => sensor_register(0x03, *lvl),
-        Setting::Debounce(ms) => sensor_register(0x02, *ms),
-        Setting::AngleSnap(on) => sensor_register(0x01, if *on { 0x10 } else { 0x00 }),
-        Setting::MotionSync(on) => {
-            let mut p = [CMD_WRITE, 0x00, 0x00, 0xa9, 0x0a, 0x08, 0x4d, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-            let val = u8::from(*on);
-            // The same packet also carries the sleep timer, not configurable yet.
-            let sleep_min = 0x05;
-            p[7] = val;
-            p[8] = complement(val);
-            p[9] = sleep_min;
-            p[10] = complement(sleep_min);
-            finish(p)
-        }
-    }
 }
 
 /// GetBatteryLevel query (`0x04`), verified on the `373b:1085` dongle.
@@ -287,6 +190,38 @@ pub fn eeprom_read(addr: u16, len: u8) -> Packet {
     ])
 }
 
+/// Write `data` (max [`EEPROM_CHUNK`] bytes) to the configuration memory at `addr`.
+pub fn set_eeprom(addr: u16, data: &[u8]) -> Option<Packet> {
+    if data.is_empty() || data.len() > EEPROM_CHUNK as usize {
+        return None;
+    }
+    let [hi, lo] = addr.to_be_bytes();
+    let mut p = [0u8; 16];
+    p[..5].copy_from_slice(&[CMD_WRITE, 0, hi, lo, data.len() as u8]);
+    p[5..5 + data.len()].copy_from_slice(data);
+    Some(finish(p))
+}
+
+/// Whether `report` answers `request`: same command and address. Some firmware answers
+/// GetEEPROM with the SetEEPROM command code; a SetEEPROM is acknowledged by its echo.
+pub fn is_reply_to(request: &Packet, report: &[u8]) -> bool {
+    let Some(p) = payload_of(report) else { return false };
+    let same_cmd = p[0] == request[1] || (request[1] == CMD_GET_EEPROM && p[0] == CMD_WRITE);
+    same_cmd && p[2..4] == request[3..5]
+}
+
+/// Status byte of a reply (0 = ok).
+pub fn reply_status(report: &[u8]) -> Option<u8> {
+    payload_of(report).map(|p| p[1])
+}
+
+/// Data bytes of a reply, as long as its length field says.
+pub fn reply_data(report: &[u8]) -> Option<Vec<u8>> {
+    let p = payload_of(report)?;
+    let len = (p[4] as usize).min(10);
+    Some(p[5..5 + len].to_vec())
+}
+
 const BUTTON_NAMES: [&str; 6] = ["left", "right", "middle", "back", "forward", "bottom"];
 
 fn button_class(class: u8) -> &'static str {
@@ -323,11 +258,25 @@ fn pair_field(addr: u16, v: u8) -> Option<String> {
         0x02 => format!("DPI stage count {}", v),
         0x04 => format!("active DPI stage {}", v),
         0x0a => format!("LOD {}", v),
+        0x4c => format!("DPI LED effect {}", v),
+        0x4e => format!("DPI LED brightness {}", v),
+        0x50 => format!("DPI LED speed {}", v),
+        0x52 => format!("DPI LED enabled {}", v),
+        0x58 => format!("logo LED effect {}", v),
+        0x5a => format!("logo LED brightness {}", v),
+        0x5c => format!("logo LED breathing speed {}", v),
+        0x5e => format!("logo LED energy saving {}", v),
         0xa9 => format!("debounce {} ms", v),
         0xab => format!("motion sync {}", if v != 0 { "on" } else { "off" }),
         0xad => format!("sleep {} s", v as u32 * 10),
-        0xaf => format!("straight-line correction {}", v),
+        0xaf => format!("angle snapping (linear correction) {}", v),
         0xb1 => format!("ripple control {}", v),
+        0xb3 => format!("LEDs off while moving {}", v),
+        0xb5 => format!("sensor sleep enabled {}", v),
+        0xb7 => format!("sensor sleep time {} s", v as u32 * 10),
+        0xb9 => format!("sensor mode {}", v),
+        0xbb => format!("RF TX time {}", v),
+        0xbd => format!("angle tuning {}", v),
         _ => return None,
     })
 }
@@ -383,6 +332,7 @@ pub fn eeprom_fields(addr: u16, data: &[u8]) -> Vec<String> {
                 );
                 Some((text, 4))
             }
+            (0x54, Some(r)) if record_ok(r) => Some((format!("logo colour #{:02X}{:02X}{:02X}", r[0], r[1], r[2]), 4)),
             (0x2c..=0x4b, Some(r)) if (a - 0x2c).is_multiple_of(4) => {
                 let text = format!(
                     "DPI stage {} colour #{:02X}{:02X}{:02X}{}",
@@ -512,19 +462,29 @@ mod tests {
         p[1..].iter().fold(0u8, |acc, &x| acc.wrapping_add(x))
     }
 
+    /// Packets sent by OpenVXE before the protocol was understood, kept to test the decoder.
+    fn legacy(payload: &[u8]) -> Packet {
+        build_packet(payload).unwrap()
+    }
+    fn legacy_dpi_1600() -> Packet {
+        legacy(&[0x07, 0, 0, 0x0c, 0x08, 0x04, 0x04, 0x00, 0x4d, 0x20, 0x20, 0x00, 0x15])
+    }
+    fn legacy_polling_500() -> Packet {
+        legacy(&[0x07, 0, 0, 0x70, 0x04, 0x0b, 0x02, 0x00, 0x53])
+    }
+    fn legacy_motion_sync_on() -> Packet {
+        legacy(&[0x07, 0, 0, 0xa9, 0x0a, 0x08, 0x4d, 0x01, 0x54, 0x05, 0x50])
+    }
+
     #[test]
     fn checksum_makes_payload_sum_0x4d() {
-        for s in [
-            Setting::Dpi(1600),
-            Setting::PollingRate(500),
-            Setting::Lod(1),
-            Setting::Debounce(7),
-            Setting::MotionSync(false),
-            Setting::AngleSnap(true),
+        for p in [
+            battery_request(),
+            eeprom_read(0x0c, 8),
+            set_eeprom(0x00, &[0x02, 0x53]).unwrap(),
         ] {
-            assert_eq!(payload_sum(&encode_setting(&s)), CHECKSUM_KEY, "{s}");
+            assert_eq!(payload_sum(&p), CHECKSUM_KEY);
         }
-        assert_eq!(payload_sum(&battery_request()), CHECKSUM_KEY);
     }
 
     #[test]
@@ -537,84 +497,35 @@ mod tests {
     }
 
     #[test]
-    fn dpi_packets() {
+    fn set_eeprom_matches_hardware_test() {
+        // Report rate 500 Hz, applied and echoed by the mouse (see PROTOCOL.md).
         assert_eq!(
-            encode_setting(&Setting::Dpi(800)),
-            [0x08, 0x07, 0x00, 0x00, 0x0c, 0x08, 0x04, 0x04, 0x00, 0x4d, 0x10, 0x10, 0x00, 0x35, 0x00, 0x00, 0x88]
+            set_eeprom(0x0000, &[0x02, 0x53]).unwrap(),
+            [0x08, 0x07, 0x00, 0x00, 0x00, 0x02, 0x02, 0x53, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xef]
         );
-        assert_eq!(
-            encode_setting(&Setting::Dpi(12750)),
-            [0x08, 0x07, 0x00, 0x00, 0x0c, 0x08, 0x04, 0x04, 0x00, 0x4d, 0xff, 0xff, 0x00, 0x57, 0x00, 0x00, 0x88]
-        );
+        assert_eq!(set_eeprom(0, &[]), None);
+        assert_eq!(set_eeprom(0, &[0; 11]), None);
     }
 
     #[test]
-    fn dpi_above_max_is_clamped_not_wrapped() {
-        assert_eq!(
-            encode_setting(&Setting::Dpi(26000)),
-            encode_setting(&Setting::Dpi(MAX_DPI))
-        );
-    }
+    fn replies_are_matched_by_command_and_address() {
+        let write = set_eeprom(0x0000, &[0x02, 0x53]).unwrap();
+        assert!(is_reply_to(&write, &write));
+        assert!(!is_reply_to(&write, &set_eeprom(0x000a, &[0x02, 0x53]).unwrap()));
+        assert!(!is_reply_to(&write, &REAL_BATTERY_REPLY));
+        assert!(is_reply_to(&battery_request(), &REAL_BATTERY_REPLY));
 
-    #[test]
-    fn sensor_register_packets() {
+        let read = eeprom_read(0x0000, 10);
+        assert!(is_reply_to(&read, &REAL_EEPROM_0000));
+        assert_eq!(reply_status(&REAL_EEPROM_0000), Some(0));
         assert_eq!(
-            encode_setting(&Setting::PollingRate(1000)),
-            [0x08, 0x07, 0x00, 0x00, 0x70, 0x04, 0x0b, 0x01, 0x00, 0x54, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x72]
+            reply_data(&REAL_EEPROM_0000).unwrap(),
+            [0x01, 0x54, 0x04, 0x51, 0x01, 0x54, 0x00, 0x55, 0x00, 0x55]
         );
-        assert_eq!(
-            encode_setting(&Setting::PollingRate(250)),
-            [0x08, 0x07, 0x00, 0x00, 0x70, 0x04, 0x0b, 0x03, 0x00, 0x52, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x72]
-        );
-        assert_eq!(
-            encode_setting(&Setting::Lod(2)),
-            [0x08, 0x07, 0x00, 0x00, 0x70, 0x04, 0x03, 0x02, 0x00, 0x53, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7a]
-        );
-        assert_eq!(
-            encode_setting(&Setting::Debounce(4)),
-            [0x08, 0x07, 0x00, 0x00, 0x70, 0x04, 0x02, 0x04, 0x00, 0x51, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7b]
-        );
-        assert_eq!(
-            encode_setting(&Setting::AngleSnap(true)),
-            [0x08, 0x07, 0x00, 0x00, 0x70, 0x04, 0x01, 0x10, 0x00, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7c]
-        );
-    }
-
-    #[test]
-    fn motion_sync_packet() {
-        assert_eq!(
-            encode_setting(&Setting::MotionSync(true)),
-            [0x08, 0x07, 0x00, 0x00, 0xa9, 0x0a, 0x08, 0x4d, 0x01, 0x54, 0x05, 0x50, 0x00, 0x00, 0x00, 0x00, 0x94]
-        );
-    }
-
-    #[test]
-    fn adjust_clamps_ranges() {
-        let mut dpi = Setting::Dpi(MAX_DPI);
-        dpi.adjust(1);
-        assert_eq!(dpi, Setting::Dpi(MAX_DPI));
-        let mut dpi = Setting::Dpi(MIN_DPI);
-        dpi.adjust(-1);
-        assert_eq!(dpi, Setting::Dpi(MIN_DPI));
-
-        let mut rate = Setting::PollingRate(250);
-        rate.adjust(1);
-        assert_eq!(rate, Setting::PollingRate(500));
-        rate.adjust(1);
-        rate.adjust(1);
-        assert_eq!(rate, Setting::PollingRate(1000));
-        rate.adjust(-1);
-        rate.adjust(-1);
-        rate.adjust(-1);
-        assert_eq!(rate, Setting::PollingRate(250));
-
-        let mut deb = Setting::Debounce(20);
-        deb.adjust(1);
-        assert_eq!(deb, Setting::Debounce(20));
-
-        let mut sync = Setting::MotionSync(true);
-        sync.adjust(-1);
-        assert_eq!(sync, Setting::MotionSync(false));
+        // Some firmware answers GetEEPROM with the SetEEPROM code.
+        let mut as_write = REAL_EEPROM_0000;
+        as_write[1] = CMD_WRITE;
+        assert!(is_reply_to(&read, &as_write));
     }
 
     #[test]
@@ -647,7 +558,7 @@ mod tests {
     fn describe_dpi_write_as_two_stages() {
         // The legacy dpi/50 encoding is wrong for the PAW3395SE: asking 1600 DPI writes code
         // 0x20, which the sensor reads as 1400 DPI, and stage 1 is forced to 200 DPI.
-        let dpi = describe(&encode_setting(&Setting::Dpi(1600)));
+        let dpi = describe(&legacy_dpi_1600());
         assert!(
             dpi.ends_with(
                 "DPI stage 1: 200 DPI (PAW3395SE) x=0x04 y=0x04 ex=0x00; \
@@ -659,20 +570,24 @@ mod tests {
 
     #[test]
     fn describe_legacy_0x70_writes_as_forward_button() {
-        let rate = describe(&encode_setting(&Setting::PollingRate(500)));
+        let rate = describe(&legacy_polling_500());
         assert!(rate.contains("button forward: wheel"), "{rate}");
         assert!(
             rate.contains("matches OpenVXE legacy write: polling rate code 2"),
             "{rate}"
         );
-        assert!(describe(&encode_setting(&Setting::Lod(2))[1..]).contains("legacy write: LOD 2"));
+        // Without the report ID, as some capture tools export it.
+        let lod = legacy(&[0x07, 0, 0, 0x70, 0x04, 0x03, 0x02, 0x00, 0x53]);
+        assert!(describe(&lod[1..]).contains("legacy write: LOD 2"));
     }
 
     #[test]
     fn describe_motion_sync_write_covers_debounce_and_sleep() {
-        let sync = describe(&encode_setting(&Setting::MotionSync(true)));
+        let sync = describe(&legacy_motion_sync_on());
         assert!(
-            sync.contains("debounce 8 ms; motion sync on; sleep 50 s; straight-line correction 0 [bad complement]"),
+            sync.contains(
+                "debounce 8 ms; motion sync on; sleep 50 s; angle snapping (linear correction) 0 [bad complement]"
+            ),
             "{sync}"
         );
     }
@@ -703,7 +618,7 @@ mod tests {
             "CMD 0x30 addr=0x000C len=2 data=[10 45] status=0x01 (rejected?)"
         );
 
-        let mut corrupted = encode_setting(&Setting::Dpi(800));
+        let mut corrupted = legacy_dpi_1600();
         corrupted[16] ^= 0xff;
         assert!(describe(&corrupted).ends_with("[bad checksum]"));
         assert_eq!(describe(&[0x08, 0x07]), "short report (2 bytes)");
@@ -786,19 +701,15 @@ mod tests {
 
     #[test]
     fn eeprom_fields_group_unknown_bytes() {
-        // Colour record, generic record, then bytes that are neither pairs nor records.
-        let fields = eeprom_fields(
-            0x48,
-            &[0xff, 0x00, 0xff, 0x57, 0x02, 0x53, 0xff, 0x00, 0xff, 0x57, 0x01, 0xff],
-        );
         assert_eq!(
-            fields,
-            [
-                "DPI stage 8 colour #FF00FF",
-                "0x004C = 0x02",
-                "0x004E: record [FF 00 FF 57]",
-                "0x0052: [01 FF]"
-            ]
+            eeprom_fields(0x48, &[0xff, 0x00, 0xff, 0x57]),
+            ["DPI stage 8 colour #FF00FF"]
+        );
+        assert_eq!(eeprom_fields(0x54, &[0xff, 0x00, 0xff, 0x57]), ["logo colour #FF00FF"]);
+        // Unknown area: a pair, a valid record, then bytes that are neither.
+        assert_eq!(
+            eeprom_fields(0xc0, &[0x02, 0x53, 0xff, 0x00, 0xff, 0x57, 0x01, 0xff]),
+            ["0x00C0 = 0x02", "0x00C2: record [FF 00 FF 57]", "0x00C6: [01 FF]"]
         );
     }
 

@@ -108,28 +108,16 @@ fn print_report(tag: &str, report: &[u8]) {
     println!("    -> {}", protocol::describe(report));
 }
 
-/// Payload of a vendor report, without the report ID.
-fn payload(report: &[u8]) -> &[u8] {
-    if report.len() >= 17 && report[0] == protocol::REPORT_ID {
-        &report[1..]
-    } else {
-        report
-    }
-}
-
-/// Send one request and print the matching reply (same command and address).
-/// Some firmware answers GetEEPROM with the SetEEPROM command code.
+/// Send one request and return the matching reply (same command and address).
 fn request(devices: &[hidapi::HidDevice], packet: &protocol::Packet) -> Option<Vec<u8>> {
     device::send(devices, packet);
     let start = Instant::now();
     while start.elapsed() < REPLY_TIMEOUT {
-        for report in device::read_all(devices) {
-            let p = payload(&report);
-            let same_cmd = p.first() == Some(&packet[1])
-                || (packet[1] == protocol::CMD_GET_EEPROM && p.first() == Some(&protocol::CMD_WRITE));
-            if same_cmd && p.get(2..4) == Some(&packet[3..5]) {
-                return Some(report);
-            }
+        if let Some(report) = device::read_all(devices)
+            .into_iter()
+            .find(|r| protocol::is_reply_to(packet, r))
+        {
+            return Some(report);
         }
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -157,22 +145,26 @@ fn info(devices: &[hidapi::HidDevice]) {
 
 /// Read the EEPROM range in chunks, print a hex dump and decode each contiguous run of
 /// successfully read bytes as a whole, so records are not split at chunk boundaries.
-fn dump(devices: &[hidapi::HidDevice], from: u16, to: u16) {
+fn dump(devices: &[hidapi::HidDevice], from: u16, to: u16) -> Result<(), String> {
+    let mut missing = 0;
     let mut segments: Vec<(u16, Vec<u8>)> = Vec::new();
     let mut addr = from;
     while addr < to {
         let len = (to - addr).min(protocol::EEPROM_CHUNK as u16) as u8;
         match request(devices, &protocol::eeprom_read(addr, len)) {
-            Some(report) if payload(&report).get(1) == Some(&0) => {
-                let data = &payload(&report)[5..5 + len as usize];
+            Some(report) if protocol::reply_status(&report) == Some(0) => {
+                let data = protocol::reply_data(&report).unwrap_or_default();
                 match segments.last_mut() {
                     Some((start, bytes)) if *start as usize + bytes.len() == addr as usize => {
-                        bytes.extend_from_slice(data)
+                        bytes.extend_from_slice(&data)
                     }
-                    _ => segments.push((addr, data.to_vec())),
+                    _ => segments.push((addr, data)),
                 }
             }
-            reply => print_reply(&format!("[0x{:04X}]", addr), reply),
+            reply => {
+                missing += 1;
+                print_reply(&format!("[0x{:04X}]", addr), reply)
+            }
         }
         addr += len as u16;
     }
@@ -187,6 +179,13 @@ fn dump(devices: &[hidapi::HidDevice], from: u16, to: u16) {
             println!("  {}", field);
         }
     }
+    if missing > 0 {
+        return Err(format!(
+            "incomplete dump: {} chunk(s) not read (mouse asleep? move it and retry)",
+            missing
+        ));
+    }
+    Ok(())
 }
 
 fn run(opts: Options) -> Result<(), String> {
@@ -213,8 +212,7 @@ fn run(opts: Options) -> Result<(), String> {
         return Ok(());
     }
     if let Some((from, to)) = opts.dump {
-        dump(&devices, from, to);
-        return Ok(());
+        return dump(&devices, from, to);
     }
 
     if let Some(packet) = packet {

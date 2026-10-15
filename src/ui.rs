@@ -8,13 +8,34 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
     Frame,
 };
-use vxe_driver::protocol::MAX_DPI;
+use vxe_driver::config::{Setting, MAX_DPI};
 
 fn panel(title: &str) -> Block<'_> {
     Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
+}
+
+/// Connection state shown in the header.
+fn status(app: &App) -> (String, Color) {
+    let pending = app.pending_writes();
+    if app.devices.is_empty() {
+        ("Device not found".into(), Color::Red)
+    } else if app.asleep && app.config.is_none() {
+        ("Waiting for the mouse: move it to wake it up".into(), Color::Yellow)
+    } else if app.asleep {
+        (
+            format!("Mouse asleep: {} change(s) pending, move it", pending),
+            Color::Yellow,
+        )
+    } else if app.config.is_none() {
+        ("Reading configuration...".into(), Color::Yellow)
+    } else if pending > 0 {
+        (format!("Applying {} change(s)...", pending), Color::Yellow)
+    } else {
+        ("Ready".into(), Color::Green)
+    }
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -29,13 +50,23 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ])
         .split(f.area());
 
-    // Header
+    // Header: device, sensor, firmware and connection state
+    let mut device = String::from("VXE R1 SE+");
+    if app.dpi_editable() {
+        device.push_str(" (PAW3395SE)");
+    }
+    if let Some(fw) = &app.firmware {
+        device.push_str(&format!(" fw {}", fw));
+    }
+    let (status, status_color) = status(app);
     let title = Paragraph::new(Line::from(vec![
         Span::styled(
             " OpenVXE ",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" | VXE R1 SE+ | Early Beta | Press 'q' to exit"),
+        Span::raw(format!(" | {} | ", device)),
+        Span::styled(status, Style::default().fg(status_color)),
+        Span::raw(" | 'q' to exit"),
     ]))
     .block(panel(""))
     .alignment(Alignment::Center);
@@ -47,12 +78,22 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(chunks[1]);
 
-    // Settings list
-    let items: Vec<ListItem> = app
-        .items
-        .iter()
-        .map(|i| ListItem::new(i.to_string()).style(Style::default().fg(Color::White)))
-        .collect();
+    // Settings list, read from the mouse
+    let active_stage = app.config.as_ref().map(|c| c.active_stage());
+    let items: Vec<ListItem> = if app.items.is_empty() {
+        vec![ListItem::new("Waiting for the configuration...").style(Style::default().fg(Color::DarkGray))]
+    } else {
+        app.items
+            .iter()
+            .map(|item| {
+                let mut text = item.to_string();
+                if matches!(item, Setting::DpiStage { index, .. } if Some(*index) == active_stage) {
+                    text.push_str("  < active");
+                }
+                ListItem::new(text).style(Style::default().fg(Color::White))
+            })
+            .collect()
+    };
     let list = List::new(items)
         .block(panel(" Configuration (Use Arrow Keys) "))
         .highlight_style(
@@ -70,13 +111,19 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(main_chunks[1]);
 
-    // DPI gauge
-    let dpi = app.dpi();
+    // DPI gauge: active stage
+    let (dpi_percent, dpi_label) = match app.active_dpi() {
+        Some((dpi, stage)) => (
+            (dpi as f64 / MAX_DPI as f64 * 100.0).min(100.0) as u16,
+            format!("{} DPI (stage {})", dpi, stage + 1),
+        ),
+        None => (0, "--".to_string()),
+    };
     let dpi_gauge = Gauge::default()
         .block(panel(" DPI Level "))
         .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
-        .percent((dpi as f64 / MAX_DPI as f64 * 100.0) as u16)
-        .label(format!("{} DPI", dpi));
+        .percent(dpi_percent)
+        .label(dpi_label);
     f.render_widget(dpi_gauge, status_chunks[0]);
 
     // Battery gauge

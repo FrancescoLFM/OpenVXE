@@ -71,7 +71,11 @@ fn run_app<B: Backend<Error = io::Error>>(terminal: &mut Terminal<B>, app: &mut 
                     continue;
                 }
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        if app.request_quit() {
+                            return Ok(());
+                        }
+                    }
                     KeyCode::Down | KeyCode::Char('j') => app.select_next(),
                     KeyCode::Up | KeyCode::Char('k') => app.select_prev(),
                     KeyCode::Left | KeyCode::Char('h') => app.modify_setting(-1),
