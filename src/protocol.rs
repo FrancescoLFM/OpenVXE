@@ -198,101 +198,233 @@ fn payload_of(bytes: &[u8]) -> Option<[u8; 16]> {
     bytes.get(start..start + 16)?.try_into().ok()
 }
 
-/// Value bytes in `data` that are followed by their `0x55 - v` complement.
-fn complemented_values(data: &[u8]) -> Vec<u8> {
-    let mut values = Vec::new();
-    let mut i = 0;
-    while i + 1 < data.len() {
-        if data[i + 1] == complement(data[i]) {
-            values.push(data[i]);
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    values
+/// Command names of the Compx/ATK vendor protocol, as used by the official ATK HUB web driver.
+/// See docs/PROTOCOL.md.
+fn command_name(cmd: u8) -> Option<&'static str> {
+    Some(match cmd {
+        0x01 => "DownLoadData",
+        0x02 => "DownLoadDriverStatus",
+        0x03 => "GetWirelessMouseOnline",
+        0x04 => "GetBatteryLevel",
+        0x05 => "SetWirelessDonglePair",
+        0x06 => "GetWirelessDonglePairResult",
+        0x07 => "SetEEPROM",
+        0x08 => "GetEEPROM",
+        0x09 => "RestoreFactory",
+        0x0a => "ReportMouseStatus",
+        0x0d => "EnterUSBUpgradeMode",
+        0x0e => "GetCurrentConfig",
+        0x0f => "SetCurrentConfig",
+        0x10 => "GetMouseCIDMID",
+        0x12 => "GetMouseVersion",
+        0x13 => "DongleExitPair",
+        0x14 => "Set4KRGBMode",
+        0x15 => "Get4KRGBMode",
+        0x16 => "SetFarDistanceMode",
+        0x17 => "GetFarDistanceMode",
+        0x18 => "SetDongleLightMode",
+        0x19 => "GetDongleLightMode",
+        0x1d => "GetDongleVersion",
+        _ => return None,
+    })
 }
 
-fn on_off(v: u8) -> &'static str {
-    if v != 0 {
-        "on"
-    } else {
-        "off"
+pub const CMD_BATTERY_LEVEL: u8 = 0x04;
+pub const CMD_GET_EEPROM: u8 = 0x08;
+pub const CMD_GET_CID_MID: u8 = 0x10;
+pub const CMD_GET_VERSION: u8 = 0x12;
+
+/// Maximum data bytes in one EEPROM read/write.
+pub const EEPROM_CHUNK: u8 = 10;
+
+/// Read `len` bytes (max [`EEPROM_CHUNK`]) of the configuration memory at `addr`.
+pub fn eeprom_read(addr: u16, len: u8) -> Packet {
+    let [hi, lo] = addr.to_be_bytes();
+    finish([
+        CMD_GET_EEPROM,
+        0,
+        hi,
+        lo,
+        len.min(EEPROM_CHUNK),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ])
+}
+
+const BUTTON_NAMES: [&str; 6] = ["left", "right", "middle", "back", "forward", "bottom"];
+
+fn button_class(class: u8) -> &'static str {
+    match class {
+        0x00 => "disabled",
+        0x01 => "mouse",
+        0x02 => "dpi",
+        0x03 => "h-scroll",
+        0x04 => "fire",
+        0x05 => "shortcut",
+        0x06 => "macro",
+        0x07 => "report-rate",
+        0x08 => "light",
+        0x09 => "profile",
+        0x0a => "dpi-lock",
+        0x0b => "wheel",
+        _ => "unknown",
     }
 }
 
-/// Human-readable description of a vendor packet, for the sniffer and the capture decoder.
+/// Decode the value of a value/complement pair field of the EEPROM map.
+fn pair_field(addr: u16, v: u8) -> Option<String> {
+    Some(match addr {
+        0x00 => format!(
+            "report rate {}",
+            match v {
+                1 => "1000 Hz",
+                2 => "500 Hz",
+                4 => "250 Hz",
+                8 => "125 Hz",
+                _ => "unknown",
+            }
+        ),
+        0x02 => format!("DPI stage count {}", v),
+        0x04 => format!("active DPI stage {}", v),
+        0x0a => format!("LOD {}", v),
+        0xa9 => format!("debounce {} ms", v),
+        0xab => format!("motion sync {}", if v != 0 { "on" } else { "off" }),
+        0xad => format!("sleep {} s", v as u32 * 10),
+        0xaf => format!("straight-line correction {}", v),
+        0xb1 => format!("ripple control {}", v),
+        _ => return None,
+    })
+}
+
+/// The pre-research OpenVXE interpretation of writes to 0x70: `[register, value, 0, 0x55 - value]`.
+fn legacy_sensor_register(record: &[u8]) -> Option<String> {
+    let [reg, v, _, check] = *record else { return None };
+    if check != complement(v) {
+        return None;
+    }
+    Some(match reg {
+        0x01 => format!("angle snapping {}", if v != 0 { "on" } else { "off" }),
+        0x02 => format!("debounce {} ms", v),
+        0x03 => format!("LOD {}", v),
+        0x0b => format!("polling rate code {}", v),
+        _ => format!("register 0x{:02X} = 0x{:02X}", reg, v),
+    })
+}
+
+/// Decode EEPROM data starting at `addr` field by field.
+fn describe_eeprom(addr: u16, data: &[u8]) -> String {
+    let mut fields = Vec::new();
+    let mut a = addr;
+    let mut rest = data;
+    while !rest.is_empty() {
+        let record = rest.get(..4);
+        let (text, used) = match (a, record) {
+            (0x0c..=0x2b, Some(r)) if (a - 0x0c).is_multiple_of(4) => {
+                let ok = r[3] == VALUE_KEY.wrapping_sub(r[0].wrapping_add(r[1]).wrapping_add(r[2]));
+                let text = format!(
+                    "DPI stage {}: x=0x{:02X} y=0x{:02X} ex=0x{:02X}{}",
+                    (a - 0x0c) / 4 + 1,
+                    r[0],
+                    r[1],
+                    r[2],
+                    if ok { "" } else { " [record checksum mismatch]" }
+                );
+                (text, 4)
+            }
+            (0x60..=0x9f, Some(r)) if (a - 0x60).is_multiple_of(4) => {
+                let slot = ((a - 0x60) / 4) as usize;
+                let name = BUTTON_NAMES
+                    .get(slot)
+                    .map_or(format!("key slot {}", slot), |n| format!("button {}", n));
+                let ok = r[3] == VALUE_KEY.wrapping_sub(r[0].wrapping_add(r[1]).wrapping_add(r[2]));
+                let mut text = format!("{}: {} v1=0x{:02X} v2=0x{:02X}", name, button_class(r[0]), r[1], r[2]);
+                if !ok {
+                    text.push_str(" [record checksum mismatch");
+                    if a == 0x70 {
+                        if let Some(legacy) = legacy_sensor_register(r) {
+                            text.push_str(&format!("; matches OpenVXE legacy write: {}", legacy));
+                        }
+                    }
+                    text.push(']');
+                }
+                (text, 4)
+            }
+            _ => match (pair_field(a, rest[0]), rest.get(1)) {
+                (Some(field), Some(&check)) => {
+                    let ok = if check == complement(rest[0]) {
+                        ""
+                    } else {
+                        " [bad complement]"
+                    };
+                    (format!("{}{}", field, ok), 2)
+                }
+                _ => {
+                    fields.push(format!("0x{:04X}: [{}]", a, to_hex(rest)));
+                    break;
+                }
+            },
+        };
+        fields.push(text);
+        a = a.wrapping_add(used as u16);
+        rest = &rest[used.min(rest.len())..];
+    }
+    fields.join("; ")
+}
+
+/// Human-readable description of a vendor packet, for the sniffer, the probe and the capture decoder.
 ///
-/// Known commands are decoded; unknown ones are split into command/address/length/data,
-/// and value/complement pairs are highlighted to help reverse engineering.
+/// Payload layout: `[cmd, status, addr_hi, addr_lo, len, data..., checksum]`. Known commands
+/// and EEPROM fields are decoded; anything else is shown raw to help reverse engineering.
 pub fn describe(bytes: &[u8]) -> String {
     let Some(p) = payload_of(bytes) else {
         return format!("short report ({} bytes)", bytes.len());
     };
     let bad_checksum = if checksum(&p) == p[15] { "" } else { " [bad checksum]" };
+    let status = if p[1] != 0 {
+        format!(" status=0x{:02X} (rejected?)", p[1])
+    } else {
+        String::new()
+    };
     let addr = u16::from_be_bytes([p[2], p[3]]);
     let len = p[4] as usize;
     let data = &p[5..(5 + len).min(15)];
-
-    let values = complemented_values(data);
-    let values = if values.is_empty() {
-        String::new()
-    } else {
-        format!(" values=[{}]", to_hex(&values))
-    };
+    let is_query = p[1..15].iter().all(|&b| b == 0);
+    let name = command_name(p[0]).map_or(format!("CMD 0x{:02X}", p[0]), str::to_string);
 
     let body = match p[0] {
-        CMD_BATTERY if p[1..15].iter().all(|&b| b == 0) => "BATTERY query".to_string(),
-        CMD_BATTERY => format!(
-            "BATTERY response raw={} ({}%) [{}]",
-            p[4],
-            p[4].saturating_mul(2).min(100),
-            to_hex(&p[1..15])
+        _ if is_query => format!("{} query", name),
+        CMD_BATTERY_LEVEL => format!(
+            "{}: {}%, {}, {} mV",
+            name,
+            p[5],
+            if p[6] != 0 { "charging" } else { "not charging" },
+            u16::from_be_bytes([p[7], p[8]])
         ),
-        CMD_WRITE => {
-            let known = match (addr, data) {
-                (0x0c, _) => format!(
-                    "DPI X={} Y={} (p[11]=0x{:02X}, suspected high byte)",
-                    p[9] as u32 * DPI_STEP as u32,
-                    p[10] as u32 * DPI_STEP as u32,
-                    p[11]
-                ),
-                (0x70, [0x01, v, ..]) => format!("angle snapping {}", on_off(*v)),
-                (0x70, [0x02, v, ..]) => format!("debounce {} ms", v),
-                (0x70, [0x03, v, ..]) => format!("LOD {}", v),
-                (0x70, [0x0b, v, ..]) => format!(
-                    "polling rate {}",
-                    match v {
-                        0x01 => "1000 Hz",
-                        0x02 => "500 Hz",
-                        0x03 => "250 Hz",
-                        _ => "unknown",
-                    }
-                ),
-                (0x70, [reg, v, ..]) => format!("unknown sensor register 0x{:02X} = 0x{:02X}", reg, v),
-                (0xa9, _) => format!("motion sync {}, sleep {} min", on_off(p[7]), p[9]),
-                _ => "unknown address".to_string(),
-            };
-            format!(
-                "WRITE addr=0x{:04X} len={} data=[{}] -> {}{}",
-                addr,
-                len,
-                to_hex(data),
-                known,
-                values
-            )
+        CMD_GET_CID_MID => format!("{}: CID={} MID={}", name, p[5], p[6]),
+        CMD_GET_VERSION => format!("{}: firmware {:x}.{:02x}", name, p[5], p[6]),
+        CMD_WRITE | CMD_GET_EEPROM if data.iter().all(|&b| b == 0) => {
+            format!("{} 0x{:04X} len={}", name, addr, len)
         }
-        cmd => format!(
-            "CMD 0x{:02X} p1=0x{:02X} addr=0x{:04X} len={} data=[{}]{}",
-            cmd,
-            p[1],
+        CMD_WRITE | CMD_GET_EEPROM => format!(
+            "{} 0x{:04X} len={} data=[{}] -> {}",
+            name,
             addr,
             len,
             to_hex(data),
-            values
+            describe_eeprom(addr, data)
         ),
+        _ => format!("{} addr=0x{:04X} len={} data=[{}]", name, addr, len, to_hex(data)),
     };
-    format!("{}{}", body, bad_checksum)
+    format!("{}{}{}", body, status, bad_checksum)
 }
 
 #[cfg(test)]
@@ -427,23 +559,66 @@ mod tests {
     }
 
     #[test]
-    fn describe_known_packets() {
-        let dpi = describe(&encode_setting(&Setting::Dpi(1600)));
-        assert!(dpi.contains("DPI X=1600 Y=1600"), "{dpi}");
-        assert!(!dpi.contains("bad checksum"));
-
-        assert!(describe(&encode_setting(&Setting::PollingRate(500))).contains("polling rate 500 Hz"));
-        assert!(describe(&encode_setting(&Setting::Debounce(7))).contains("debounce 7 ms"));
-        assert!(describe(&encode_setting(&Setting::MotionSync(true))).contains("motion sync on, sleep 5 min"));
-        assert_eq!(describe(&battery_request()), "BATTERY query");
-        // Without the report ID, as some capture tools export it.
-        assert!(describe(&encode_setting(&Setting::Lod(2))[1..]).contains("LOD 2"));
+    fn eeprom_read_matches_published_frame() {
+        // GetEEPROM of 8 bytes at 0x60, from the ATK Fierce X protocol notes (see PROTOCOL.md).
+        let expected = [0x08, 0x00, 0x00, 0x60, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xdd];
+        assert_eq!(eeprom_read(0x60, 8)[1..], expected);
+        assert_eq!(eeprom_read(0x60, 50)[5], EEPROM_CHUNK);
     }
 
     #[test]
-    fn describe_unknown_packets() {
-        let unknown = describe(&build_packet(&[0x08, 0x00, 0x00, 0x0c, 0x02, 0x10, 0x45]).unwrap());
-        assert_eq!(unknown, "CMD 0x08 p1=0x00 addr=0x000C len=2 data=[10 45] values=[10]");
+    fn describe_dpi_write_as_two_stages() {
+        let dpi = describe(&encode_setting(&Setting::Dpi(1600)));
+        assert!(
+            dpi.ends_with("DPI stage 1: x=0x04 y=0x04 ex=0x00; DPI stage 2: x=0x20 y=0x20 ex=0x00"),
+            "{dpi}"
+        );
+    }
+
+    #[test]
+    fn describe_legacy_0x70_writes_as_forward_button() {
+        let rate = describe(&encode_setting(&Setting::PollingRate(500)));
+        assert!(rate.contains("button forward: wheel"), "{rate}");
+        assert!(
+            rate.contains("matches OpenVXE legacy write: polling rate code 2"),
+            "{rate}"
+        );
+        assert!(describe(&encode_setting(&Setting::Lod(2))[1..]).contains("legacy write: LOD 2"));
+    }
+
+    #[test]
+    fn describe_motion_sync_write_covers_debounce_and_sleep() {
+        let sync = describe(&encode_setting(&Setting::MotionSync(true)));
+        assert!(
+            sync.contains("debounce 8 ms; motion sync on; sleep 50 s; straight-line correction 0 [bad complement]"),
+            "{sync}"
+        );
+    }
+
+    #[test]
+    fn describe_queries_and_responses() {
+        assert_eq!(describe(&battery_request()), "GetFarDistanceMode query");
+        assert_eq!(describe(&eeprom_read(0x60, 8)), "GetEEPROM 0x0060 len=8");
+
+        let battery = build_packet(&[0x04, 0x00, 0x00, 0x00, 0x02, 0x5f, 0x00, 0x10, 0x00]).unwrap();
+        assert_eq!(describe(&battery), "GetBatteryLevel: 95%, not charging, 4096 mV");
+        let version = build_packet(&[0x12, 0x00, 0x00, 0x00, 0x02, 0x03, 0x15]).unwrap();
+        assert_eq!(describe(&version), "GetMouseVersion: firmware 3.15");
+
+        let read = build_packet(&[0x08, 0x00, 0x00, 0x00, 0x06, 0x01, 0x54, 0x04, 0x51, 0x00, 0x55]).unwrap();
+        assert_eq!(
+            describe(&read),
+            "GetEEPROM 0x0000 len=6 data=[01 54 04 51 00 55] -> report rate 1000 Hz; DPI stage count 4; active DPI stage 0"
+        );
+    }
+
+    #[test]
+    fn describe_unknown_and_invalid_packets() {
+        let unknown = describe(&build_packet(&[0x30, 0x01, 0x00, 0x0c, 0x02, 0x10, 0x45]).unwrap());
+        assert_eq!(
+            unknown,
+            "CMD 0x30 addr=0x000C len=2 data=[10 45] status=0x01 (rejected?)"
+        );
 
         let mut corrupted = encode_setting(&Setting::Dpi(800));
         corrupted[16] ^= 0xff;
