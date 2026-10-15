@@ -1,0 +1,183 @@
+# OpenVXE — Analisi, bug e roadmap verso la 1.0
+
+Analisi dello stato attuale (`src/main.rs`, 349 righe, commit `e78465b`) con bug, feature mancanti e idee per arrivare a una versione stabile.
+Riferimenti nel formato `src/main.rs:riga`.
+
+Legenda priorità: 🔴 alta · 🟠 media · 🟢 bassa
+
+---
+
+## 1. Bug
+
+### 🔴 1.1 DPI oltre 12.750 non funziona (overflow `u8`)
+`src/main.rs:82` — `let val = (dpi / 50) as u8;`
+
+Con DPI max 26.000 il valore è `520`, che troncato a `u8` diventa `8` → il mouse riceve **400 DPI** invece di 26.000. Tutto ciò che supera `255 × 50 = 12.750` viene inviato errato, quindi il range dichiarato nel README (50–26.000) è falso.
+Il protocollo quasi certamente prevede un byte alto (probabilmente `p[11]` o bit extra in un byte vicino) che va scoperto sniffando il software ufficiale a DPI > 12.750.
+Nel frattempo: limitare il clamp a 12.750 in `modify_setting` (`src/main.rs:258`).
+
+### 🔴 1.2 La UI mostra valori finti, non quelli del mouse
+`src/main.rs:154-161` — i settaggi partono da default hardcoded (800 DPI, 1000 Hz, ...). Non viene mai letta la configurazione reale.
+Conseguenze:
+- All'avvio la UI può mostrare valori diversi da quelli attivi.
+- La prima pressione di ←/→ invia `default ± step`, non `valore_reale ± step` (es. mouse a 1600 DPI → premo → → il mouse va a 850 DPI).
+
+Serve un comando di lettura config (vedi 2.1).
+
+### 🔴 1.3 Panic lascia il terminale rotto
+`src/main.rs:137` (`HidApi::new().unwrap()`) e `src/main.rs:143` (`set_blocking_mode(false).unwrap()`) vengono eseguiti **dopo** `enable_raw_mode()` + `EnterAlternateScreen`. Un panic lascia il terminale in raw mode e nell'alternate screen (serve `reset`).
+Fix: inizializzare HID prima di entrare in raw mode, gestire gli errori con `?`/messaggio, e installare un `std::panic::set_hook` che ripristina il terminale.
+
+### 🟠 1.4 Possibile panic con uptime < 60 s
+`src/main.rs:152` — `Instant::now() - Duration::from_secs(60)`. Su Linux `Instant` è basato su `CLOCK_MONOTONIC` (parte dal boot): se il programma parte entro 60 s dal boot la sottrazione va in underflow → panic.
+Fix: `Instant::now().checked_sub(...)` oppure usare `Option<Instant>` per "mai richiesto".
+
+### 🟠 1.5 Ogni comando viene inviato 2× a ogni interfaccia, errori ignorati
+`src/main.rs:72-75` — per ogni device si chiama sia `write()` sia `send_feature_report()`, scartando i risultati. Inoltre vengono aperte **tutte** le interfacce HID con quel VID/PID (`src/main.rs:140-147`), incluse quelle di input standard.
+Problemi:
+- comandi duplicati (innocui solo finché il firmware è idempotente);
+- il log scrive `TX: Applied ...` (`src/main.rs:270`) anche se ogni scrittura è fallita.
+
+Fix: filtrare per `usage_page`/`interface_number` del canale vendor, usare un solo metodo di invio, propagare l'errore e mostrarlo nel log.
+
+### 🟠 1.6 Motion Sync sovrascrive il timer di sleep
+`src/main.rs:112` — il pacchetto Motion Sync contiene anche il tempo di sleep, forzato a `0x05`. Chi aveva impostato un altro sleep dal software ufficiale lo perde silenziosamente.
+Fix: rendere lo sleep un settaggio vero (vedi 2.4) e inviare entrambi i valori correnti.
+
+### 🟠 1.7 Batteria: 0% rosso prima della prima lettura
+`battery: 0` (`src/main.rs:151`) è indistinguibile da "batteria scarica". Usare `Option<u8>` e mostrare `--` / "In attesa…" finché non arriva la risposta. La formula `raw * 2` (`src/main.rs:202,204`) andrebbe verificata (step del 2%? scala 0–50?), e manca lo stato di carica.
+
+### 🟠 1.8 Nessuna gestione di disconnessione / hotplug
+I device vengono aperti una sola volta all'avvio. Se il mouse/dongle viene staccato o va in sleep, l'app continua a scrivere nel vuoto; se il mouse viene collegato dopo l'avvio non verrà mai trovato. Serve un ri-scan periodico (es. ogni 2 s se `devices` è vuoto o se `read` restituisce errore).
+
+### 🟢 1.9 Mouse capture abilitato senza motivo
+`src/main.rs:133` — `EnableMouseCapture` ma nessun evento mouse è gestito. Effetto collaterale: nel terminale non si può più selezionare/copiare il testo (es. i log hex del sniffer). Rimuovere o implementare click/scroll.
+
+### 🟢 1.10 Eventi tastiera non filtrati per `KeyEventKind`
+`src/main.rs:227` — con crossterm 0.27 su Windows (e con il protocollo kitty) arrivano sia Press sia Release → ogni tasto modifica il valore due volte. Aggiungere `if key.kind == KeyEventKind::Press`.
+
+### 🟢 1.11 Altri dettagli
+- `src/main.rs:322` — il gauge DPI legge `app.items[0]` assumendo che il DPI sia sempre il primo elemento; fragile.
+- `src/main.rs:198` — il filtro `sz <= 8 → continue` rende inutili i controlli `sz >= 6` / `sz >= 5` successivi, e scarta eventuali risposte batteria corte.
+- `src/main.rs:207` — lo sniffer mostra solo i primi 8 byte: poco utile per il reverse engineering (vedi 3.1).
+- `src/main.rs:123` — il checksum `0x36` della richiesta batteria è hardcoded invece di usare `calc_checksum`.
+- Loop a 16 ms che ridisegna sempre anche senza cambiamenti: ~60 redraw/s di CPU sprecata.
+
+---
+
+## 2. Feature mancanti
+
+### 🔴 2.1 Lettura della configurazione dal mouse
+Il prerequisito per tutto il resto. Sniffare (Wireshark + usbmon, o USBPcap su Windows) cosa fa il software ufficiale all'avvio: quasi sicuramente esiste un comando "read" (probabilmente con lo stesso layout indirizzo/lunghezza dei comandi `0x07`, es. `0x08`) che restituisce la memoria config.
+
+### 🔴 2.2 Stadi DPI multipli
+Il mouse ha più stadi DPI selezionabili col tasto sotto. Ora si modifica solo uno stadio (indirizzo `0x0c`). Servono: numero di stadi attivi, valore per stadio, stadio corrente, eventualmente DPI X/Y separati (i due byte `p[9]`/`p[10]` sono già X e Y identici).
+
+### 🟠 2.3 Rimappatura tasti e macro
+Feature standard dei software di questa famiglia: assegnare a ogni tasto click, DPI±, tasti tastiera, multimedia, disabilitato, macro.
+
+### 🟠 2.4 Altri parametri hardware
+- Tempo di sleep / spegnimento (già nel pacchetto Motion Sync).
+- Ripple control, se supportato dal sensore.
+- Polling rate superiori se si usa un dongle 4K/8K compatibile (verificare).
+- Versione firmware di mouse e dongle.
+- Modalità di connessione (2.4 GHz / cablato) e PID alternativi: in cablato il PID è probabilmente diverso da `0x1085`.
+
+### 🟠 2.5 Profili e persistenza
+- File di config (`~/.config/openvxe/config.toml`, crate `serde` + `toml` + `directories`).
+- Salvataggio/caricamento profili nominati (es. "gaming", "desktop").
+- Applicazione automatica al collegamento del mouse.
+
+### 🟠 2.6 Modalità CLI non interattiva
+Utile per script, keybind del window manager e autostart:
+```
+openvxe --dpi 1600 --polling 1000
+openvxe --battery          # stampa 87
+openvxe --profile gaming
+```
+Crate consigliato: `clap`. Bonus: output JSON per barre di stato (waybar, polybar, i3blocks).
+
+### 🟢 2.7 UX della TUI
+- Barra di aiuto con i tasti in basso.
+- Inserimento numerico diretto del DPI (Enter → digito 1600).
+- Passo DPI variabile (Shift+←/→ = ±500).
+- Enter/Space per toggle dei booleani.
+- Conferma visiva di successo/errore per ogni settaggio.
+- Indicatore "connesso/disconnesso" nell'header.
+- Rilevamento automatico del modello nell'header invece della stringa fissa `VXE R1 SE+`.
+
+### 🟢 2.8 Notifiche
+Notifica desktop (`notify-rust`) a batteria bassa, eventualmente in un piccolo demone/systemd user service separato dalla TUI.
+
+---
+
+## 3. Qualità del progetto e "chicche"
+
+### 🔴 3.1 Documentare il protocollo (`PROTOCOL.md`)
+È la parte di maggior valore del progetto. Struttura emersa dal codice:
+
+| Byte | Significato |
+|------|-------------|
+| report ID | `0x08` |
+| `p[0]` | comando (`0x07` = scrittura, `0x17` = batteria) |
+| `p[3]` | indirizzo/registro (`0x0c` DPI, `0x70` settaggi sensore, `0xa9` power) |
+| `p[4]` | lunghezza dati |
+| `p[5..]` | dati, ogni valore seguito dal suo complemento `0x55 - v` |
+| `p[15]` | checksum `0x4D - somma(p[0..15])` |
+
+Sotto-registri a `0x70`: `0x01` angle snap, `0x02` debounce, `0x03` LOD, `0x0b` polling.
+
+Questo schema (checksum `0x55`/`0x4D`, VID `0x373b`) è tipico dei chipset Compx usati da molti mouse cinesi (VXE, ATK, VGN, MCHOSE…): con un layer di astrazione si potrebbero supportare **molti altri modelli** con poco sforzo.
+
+Lo sniffer integrato andrebbe potenziato: pacchetto completo, timestamp, TX oltre a RX, salvataggio su file, pausa/scroll.
+
+### 🔴 3.2 Rifattorizzare in moduli e aggiungere test
+Struttura proposta:
+```
+src/
+  main.rs        // argomenti, setup terminale
+  protocol.rs    // encode/decode pacchetti, checksum (puro, testabile)
+  device.rs      // discovery HID, hotplug, I/O
+  app.rs         // stato
+  ui.rs          // rendering ratatui
+```
+`protocol.rs` senza dipendenze da HID permette test unitari su ogni pacchetto (confronto con dump reali del software ufficiale). Un trait `Transport` permette un mock per i test end-to-end.
+
+### 🟠 3.3 Packaging e installazione
+- Il README è troncato: il blocco ` ```bash ` non è chiuso, c'è un `# OpenVXE` duplicato, mancano le sezioni udev, build e utilizzo.
+- Fornire il file delle regole udev nel repo, es. `udev/99-openvxe.rules`:
+  ```
+  KERNEL=="hidraw*", ATTRS{idVendor}=="373b", ATTRS{idProduct}=="1085", TAG+="uaccess"
+  ```
+- Pacchetto AUR (`openvxe` / `openvxe-git`), magari anche `.deb`/Flatpak.
+- `Cargo.toml`: il nome è `vxe_driver` (binario `vxe_driver`), meglio `openvxe`; aggiungere `description`, `license`, `repository`, `readme`.
+- Aggiungere un file `LICENSE` (il README dice "open-source" ma non c'è licenza → legalmente nessuno può contribuire/redistribuire).
+
+### 🟠 3.4 CI e pulizia codice
+- GitHub Actions: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, build release.
+- Clippy oggi segnala 3 warning: `upper_case_acronyms` (`DPI`, `LOD` → `Dpi`, `Lod`) e `inherent_to_string` (implementare `Display` per `Setting`).
+- I commenti nel codice sono in russo (`src/main.rs:200,206,278,...`): tradurli in inglese per i contributori.
+- Aggiornare le dipendenze (`ratatui 0.26` → ultima, che porta crossterm più recente).
+- Usare `anyhow`/`thiserror` per gli errori.
+
+### 🟢 3.5 Multipiattaforma
+`hidapi` funziona anche su Windows e macOS: con le fix 1.10 e il filtro per interfaccia, il supporto è quasi gratis. Su Windows serve l'interfaccia vendor corretta perché le interfacce mouse sono bloccate dal sistema.
+
+### 🟢 3.6 Idee extra
+- Tema colori configurabile.
+- Grafico storico della batteria (sparkline ratatui) con stima dell'autonomia residua.
+- Test di polling rate reale (misura degli eventi di movimento).
+- Export/import della config in formato compatibile con altri utenti (condividere profili).
+
+---
+
+## 4. Ordine di lavoro consigliato
+
+1. ✅ **Base solida** (completata): fix 1.3, 1.4, 1.10, clamp DPI a 12.750 (1.1 temporaneo), README + udev + LICENSE GPL-3.0 (3.3).
+2. **Refactor** in moduli + test del protocollo + CI (3.2, 3.4).
+3. **Reverse engineering**: sniffing del software ufficiale → `PROTOCOL.md`, lettura config (2.1), DPI alto (1.1), stadi DPI (2.2), sleep (1.6).
+4. **Robustezza**: filtro interfacce e gestione errori (1.5), hotplug (1.8), batteria `Option` + carica (1.7).
+5. **Feature utente**: profili (2.5), CLI (2.6), UX (2.7).
+6. **Espansione**: rimappatura tasti/macro (2.3), altri modelli/chipset, multipiattaforma, pacchetti.
+
+Ogni punto è un buon candidato per una PR separata e piccola.
