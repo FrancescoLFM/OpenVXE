@@ -22,13 +22,14 @@ An open-source, lightweight, and blazing-fast TUI (Terminal User Interface) driv
 * **Sleep aware:** while the mouse sleeps the dongle doesn't answer; changes are queued and sent when it wakes up.
 * **Hotplug:** the dongle can be unplugged and plugged back in (or plugged in after starting OpenVXE); the configuration is read again on reconnect.
 * **Real-time Battery Monitor:** battery level and charging state read with the vendor `GetBatteryLevel` command.
+* **Tray Icon:** `openvxe-tray` shows the battery level in the KDE Plasma system tray (or any StatusNotifierItem host) and notifies when it drops below 20%.
 * **Hex Sniffer:** Built-in packet monitor for debugging hardware responses.
 
 ## 🚀 Installation & Setup
 
 ### Arch Linux package
 
-A `PKGBUILD` for `openvxe-git` lives in [packaging/arch](packaging/arch). It builds the latest `main`, installs `openvxe`, `vxe-probe` and `vxe-decode` to `/usr/bin` and the udev rules to `/usr/lib/udev/rules.d`, so steps 1-3 below are not needed:
+A `PKGBUILD` for `openvxe-git` lives in [packaging/arch](packaging/arch). It builds the latest `main`, installs `openvxe`, `openvxe-tray`, `vxe-probe` and `vxe-decode` to `/usr/bin`, the udev rules to `/usr/lib/udev/rules.d` and the tray icon's autostart entry to `/etc/xdg/autostart`, so steps 1-3 below are not needed:
 ```bash
 cd packaging/arch
 makepkg -si
@@ -84,6 +85,18 @@ cargo build --release
 Settings are read from the mouse at startup and applied **live** as soon as you change them. If the mouse is asleep, move it to wake it up: pending changes are sent then, and quitting with changes still pending asks you to press `q` again.
 
 > ℹ️ DPI editing is enabled only for the PAW3395SE sensor (CID/MID 2,31), the only DPI encoding verified so far. Other settings work on any sensor.
+
+### Tray icon
+
+`openvxe-tray` puts the battery percentage in the system tray: green above 50%, orange down to 20%, red below, blue while charging and grey while the mouse sleeps (with the last reading) or the dongle is unplugged. The level is read every 30 seconds, and a notification is sent once each time it drops below 20%. Its menu opens the TUI in Konsole (or `$TERMINAL`). It can run while the TUI is open.
+
+The Arch package starts it at login. Otherwise:
+```bash
+./target/release/openvxe-tray &
+# start it at login
+cp packaging/desktop/openvxe-tray.desktop ~/.config/autostart/  # needs openvxe-tray in PATH
+```
+To build only the TUI, without the tray dependencies: `cargo build --release --no-default-features`.
 
 ## 🛠️ Troubleshooting
 
