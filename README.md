@@ -36,6 +36,17 @@ makepkg -si
 ```
 Then unplug and replug the USB dongle.
 
+### Fedora package
+
+A spec file lives in [packaging/fedora](packaging/fedora). `make-sources.sh` packs the current commit and its vendored crates (the build runs offline, so it also works in `mock` and COPR), then builds the RPMs if `rpm-build` is installed:
+```bash
+sudo dnf install rpm-build dnf-plugins-core
+sudo dnf builddep packaging/fedora/openvxe.spec
+packaging/fedora/make-sources.sh
+sudo dnf install packaging/fedora/rpmbuild/RPMS/x86_64/openvxe-0*.rpm
+```
+It installs the same files as the Arch package. Then unplug and replug the USB dongle.
+
 ### 1. Install Dependencies
 
 Ensure you have Rust and the required HID libraries installed.
