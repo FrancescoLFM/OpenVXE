@@ -26,6 +26,15 @@ An open-source, lightweight, and blazing-fast TUI (Terminal User Interface) driv
 
 ## 🚀 Installation & Setup
 
+### Arch Linux package
+
+A `PKGBUILD` for `openvxe-git` lives in [packaging/arch](packaging/arch). It builds the latest `main`, installs `openvxe`, `vxe-probe` and `vxe-decode` to `/usr/bin` and the udev rules to `/usr/lib/udev/rules.d`, so steps 1-3 below are not needed:
+```bash
+cd packaging/arch
+makepkg -si
+```
+Then unplug and replug the USB dongle.
+
 ### 1. Install Dependencies
 
 Ensure you have Rust and the required HID libraries installed.
